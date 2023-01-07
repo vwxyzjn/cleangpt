@@ -1,0 +1,20 @@
+[tool.poetry]
+name = "cleanrlhf"
+version = "0.1.0"
+description = ""
+authors = ["Costa Huang <costa.huang@outlook.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.9"
+datasets = "^2.8.0"
+numpy = "^1.24.1"
+torch = "^1.13.1"
+jax = "^0.4.1"
+flax = "^0.6.3"
+optax = "^0.1.4"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
