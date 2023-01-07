@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 # https://youtu.be/acxqoltilME
 
 print("===Simple attention===")
@@ -10,7 +11,7 @@ x1 = torch.rand(embed_dim)
 x2 = torch.rand(embed_dim)
 x3 = torch.rand(embed_dim)
 
-attention_scores = torch.stack([x1 @ x1, x1 @ x2, x1 @x3], dim=0)
+attention_scores = torch.stack([x1 @ x1, x1 @ x2, x1 @ x3], dim=0)
 print("attention_scores", attention_scores)
 attention_weights = F.softmax(attention_scores, dim=0)
 print("attention_weights", attention_weights)
@@ -101,9 +102,9 @@ wq2 = nn.Linear(embed_dim, embed_dim)
 q = x @ wq
 k = x @ wk
 v = x @ wv
-q = q.reshape(B, T, num_heads, head_dim).transpose(2, 1) # (B, num_heads, T, head_dim)
-k = k.reshape(B, T, num_heads, head_dim).transpose(2, 1) # (B, num_heads, T, head_dim)
-v = v.reshape(B, T, num_heads, head_dim).transpose(2, 1) # (B, num_heads, T, head_dim)
+q = q.reshape(B, T, num_heads, head_dim).transpose(2, 1)  # (B, num_heads, T, head_dim)
+k = k.reshape(B, T, num_heads, head_dim).transpose(2, 1)  # (B, num_heads, T, head_dim)
+v = v.reshape(B, T, num_heads, head_dim).transpose(2, 1)  # (B, num_heads, T, head_dim)
 
 attention_scores = q @ k.transpose(-1, -2) / torch.sqrt(torch.tensor(head_dim))
 print("attention scores", attention_scores)
