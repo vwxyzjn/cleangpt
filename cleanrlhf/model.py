@@ -128,9 +128,7 @@ if __name__ == "__main__":
     embed_dim = 12
     key = jax.random.PRNGKey(0)
     key, params_key, attn_pdrop_key, resid_pdrop_key = jax.random.split(key=key, num=4)
-    # genereate a random input
     x = jax.random.normal(key, (1, block_size, embed_dim)) # B, T, C; or batch_size, sequence_length, embedding_dimensionality
-
 
     # CausalSelfAttention Demo
     attn = CausalSelfAttention(embed_dim=embed_dim, n_head=3, attn_pdrop=0.1, resid_pdrop=0.1, block_size=block_size)
