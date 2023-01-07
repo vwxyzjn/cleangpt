@@ -76,24 +76,6 @@ class Block(nn.Module):
     attn_pdrop: int
     resid_pdrop: int
     block_size: int  # alias: T, sequence_length
-    # def __init__(self, config):
-    #     super().__init__()
-    #     self.ln_1 = nn.LayerNorm(config.embed_dim)
-    #     self.attn = CausalSelfAttention(config)
-    #     self.ln_2 = nn.LayerNorm(config.embed_dim)
-    #     self.mlp = nn.ModuleDict(dict(
-    #         c_fc    = nn.Linear(config.embed_dim, 4 * config.embed_dim),
-    #         c_proj  = nn.Linear(4 * config.embed_dim, config.embed_dim),
-    #         act     = NewGELU(),
-    #         dropout = nn.Dropout(config.resid_pdrop),
-    #     ))
-    #     m = self.mlp
-    #     self.mlpf = lambda x: m.dropout(m.c_proj(m.act(m.c_fc(x)))) # MLP forward
-
-    # def forward(self, x):
-    #     x = x + self.attn(self.ln_1(x))
-    #     x = x + self.mlpf(self.ln_2(x))
-    #     return x
     @nn.compact
     def __call__(self, x: jnp.array, key: jax.random.KeyArray):
         key, attn_pdrop_key, resid_pdrop_key, resid_pdrop_key2 = jax.random.split(key, 4)
