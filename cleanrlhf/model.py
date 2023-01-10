@@ -144,11 +144,14 @@ class GPT(nn.Module):
         x = nn.LayerNorm(self.c.embd_dim)(x)
         logits = nn.Dense(self.vocab_size, use_bias=False)(x)
 
-        # Costa: mask out the gradient for indices with values = -1
-        # should be equivalent to `ignore_index=-1` in F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-        logits = jnp.where(jnp.expand_dims(targets, axis=-1) == -1, -1e8, logits)
-        loss = optax.softmax_cross_entropy_with_integer_labels(logits.reshape(-1, jnp.shape(logits)[-1]), targets.reshape(-1))
-        return loss, logits
+        # Costa: the following should be equivalent to `ignore_index=-1`
+        # in F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        valid_targets = jnp.where(targets == -1, 0, targets)  # remove the mask from the integer labels for cross entropy
+        loss = optax.softmax_cross_entropy_with_integer_labels(
+            logits.reshape(-1, jnp.shape(logits)[-1]), valid_targets.reshape(-1)
+        )
+        loss = loss.mean(where=targets.reshape(-1) != -1)  # only calculate the mean for indices that are ignored
+        return loss, (logits, key)
 
 
 MODELS_PRESET: Dict[str, GPTConfig] = {
@@ -203,7 +206,24 @@ if __name__ == "__main__":
         vocab_size=vocab_size,
         block_size=block_size,
     )
-    x = jax.random.randint(key, (1, block_size), minval=0, maxval=vocab_size)  # B, T; or batch_size, sequence_length
-    y = jax.random.randint(key, (1,), minval=0, maxval=vocab_size)  # B; or batch_size, sequence_length
-    gpt_params = gpt.init(params_key, x, x, key)
-    gpt_y = gpt.apply(gpt_params, x, x, key)
+    # x = jax.random.randint(key, (1, block_size), minval=0, maxval=vocab_size)  # B, T; or batch_size, sequence_length
+    # y = jax.random.randint(key, (1,), minval=0, maxval=vocab_size)  # B; or batch_size, sequence_length
+    x = jnp.array([[0, 1, 1, 2, 2, 1, 0, 1, 1, 1, 2], [0, 1, 1, 2, 0, 2, 0, 0, 1, 1, 2], [0, 1, 2, 2, 1, 0, 0, 0, 1, 1, 2]])
+    y = jnp.array(
+        [
+            [-1, -1, -1, -1, -1, 0, 1, 1, 1, 2, 2],
+            [-1, -1, -1, -1, -1, 0, 0, 1, 1, 2, 2],
+            [-1, -1, -1, -1, -1, 0, 0, 1, 1, 2, 2],
+        ]
+    )
+    gpt = GPT(
+        c=GPTConfig(
+            n_layer=n_layer,
+            n_head=n_head,
+            embd_dim=embd_dim,
+        ),
+        vocab_size=3,
+        block_size=11,
+    )
+    gpt_params = gpt.init(params_key, x, y, key)
+    gpt_loss, gpt_y, key = gpt.apply(gpt_params, x, y, key)
