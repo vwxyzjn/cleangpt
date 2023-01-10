@@ -1,6 +1,10 @@
+from dataclasses import dataclass
+from typing import Dict
+
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
+import optax
 
 
 def dropout(x: jnp.ndarray, rate: float, key: jax.random.KeyArray) -> jnp.ndarray:
@@ -37,7 +41,7 @@ class CausalSelfAttention(nn.Module):
     explicit implementation here to show that there is nothing too scary here.
     """
 
-    embed_dim: int  # alias: C
+    embd_dim: int  # alias: C
     n_head: int  # alias: nh
     attn_pdrop: int
     resid_pdrop: int
@@ -45,8 +49,8 @@ class CausalSelfAttention(nn.Module):
 
     @nn.compact
     def __call__(self, x: jnp.array, attn_pdrop_key: jax.random.KeyArray, resid_pdrop_key: jax.random.KeyArray):
-        assert self.embed_dim % self.n_head == 0, "embed_dim must be divisible by num_heads"
-        B, T, C = jnp.shape(x)  # batch size, sequence length, embedding dimensionality (embed_dim
+        assert self.embd_dim % self.n_head == 0, "embd_dim must be divisible by num_heads"
+        B, T, C = jnp.shape(x)  # batch size, sequence length, embedding dimensionality (embd_dim
         head_dim = C // self.n_head  # alias: hm
         bias = jnp.tril(jnp.ones((self.block_size, self.block_size))).reshape(1, 1, self.block_size, self.block_size)
 
@@ -71,25 +75,26 @@ class CausalSelfAttention(nn.Module):
 class Block(nn.Module):
     """an unassuming Transformer block"""
 
-    embed_dim: int  # alias: C
+    embd_dim: int  # alias: C
     n_head: int  # alias: nh
     attn_pdrop: int
     resid_pdrop: int
     block_size: int  # alias: T, sequence_length
+
     @nn.compact
     def __call__(self, x: jnp.array, key: jax.random.KeyArray):
         key, attn_pdrop_key, resid_pdrop_key, resid_pdrop_key2 = jax.random.split(key, 4)
         oldx = x
-        x = nn.LayerNorm(self.embed_dim)(x)
-        x = CausalSelfAttention(self.embed_dim, self.n_head, self.attn_pdrop, self.resid_pdrop, self.block_size)(
+        x = nn.LayerNorm(self.embd_dim)(x)
+        x = CausalSelfAttention(self.embd_dim, self.n_head, self.attn_pdrop, self.resid_pdrop, self.block_size)(
             x, attn_pdrop_key, resid_pdrop_key
         )
         x = oldx + x
 
         oldx = x
-        x = nn.Dense(4 * self.embed_dim)(x)
+        x = nn.Dense(4 * self.embd_dim)(x)
         x = NewGELU()(x)
-        x = nn.Dense(self.embed_dim)(x)
+        x = nn.Dense(self.embd_dim)(x)
         x = dropout(x, rate=self.resid_pdrop, key=resid_pdrop_key2)
         x = oldx + x
         return x
@@ -100,19 +105,112 @@ class Block(nn.Module):
         return x
 
 
+class GPT(nn.Module):
+    n_layer: int
+    n_head: int
+    embd_dim: int
+    # these options must be filled in externally
+    vocab_size: int
+    block_size: int
+    # dropout hyperparameters
+    embd_pdrop: int = 0.1
+    resid_pdrop: int = 0.1
+    attn_pdrop: int = 0.1
+
+    # self.transformer = nn.ModuleDict(dict(
+    #     wte = nn.Embed(self.vocab_size, self.embd_dim), # word to embedding
+    #     wpe = nn.Embed(self.block_size, self.embd_dim), # word to position embedding
+    #     drop = nn.Dropout(self.embd_pdrop),
+    #     h = nn.ModuleList([Block(self) for _ in range(self.n_layer)]),
+    #     ln_f = nn.LayerNorm(self.embd_dim),
+    # ))
+    # self.lm_head = nn.Linear(self.embd_dim, self.vocab_size, bias=False)
+
+    @nn.compact
+    def __call__(self, idx: jnp.array, target: jnp.array, key: jax.random.KeyArray):
+        key, embd_pdrop_key = jax.random.split(key, 2)
+        _, T = jnp.shape(idx)  # B, T
+        assert T <= self.block_size, f"Cannot forward sequence of length {T}, block size is only {self.block_size}"
+        pos = jnp.array([jnp.arange(0, T, dtype=jnp.int32)])  # shape (1, T)
+
+        # forward the GPT model itself
+        tok_embd = nn.Embed(self.vocab_size, self.embd_dim)(idx)  # token embeddings of shape (B, T, embd_dim)
+        pos_embd = nn.Embed(self.block_size, self.embd_dim)(pos)  # position embeddings of shape (1, T, embd_dim)
+        x = dropout(tok_embd + pos_embd, rate=self.embd_pdrop, key=embd_pdrop_key)
+        for _ in range(self.n_layer):
+            x = Block(
+                self.embd_dim,
+                self.n_head,
+                self.attn_pdrop,
+                self.resid_pdrop,
+                self.block_size,
+            )(x, key)
+        x = nn.LayerNorm(self.embd_dim)(x)
+        logits = nn.Dense(self.vocab_size, use_bias=False)(x)
+
+        # Costa: mask out the gradient for indices with values = -1
+        # should be equivalent to `ignore_index=-1` in F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        logits = jnp.where(target == -1, -1e8, logits)
+        loss = optax.softmax_cross_entropy(logits.reshape(-1, jnp.shape(logits)[-1]), target.reshape(-1))
+        return loss, logits
+
+
+@dataclass
+class GPTConfig:
+    n_layer: int
+    n_head: int
+    embd_dim: int
+
+
+MODELS_PRESET: Dict[str, GPTConfig] = {
+    "openai-gpt": GPTConfig(n_layer=12, n_head=12, embd_dim=768),  # 117M params
+    # GPT-2 configs
+    "gpt2": GPTConfig(n_layer=12, n_head=12, embd_dim=768),  # 124M params
+    "gpt2-medium": GPTConfig(n_layer=24, n_head=16, embd_dim=1024),  # 350M params
+    "gpt2-large": GPTConfig(n_layer=36, n_head=20, embd_dim=1280),  # 774M params
+    "gpt2-xl": GPTConfig(n_layer=48, n_head=25, embd_dim=1600),  # 1558M params
+    # Gophers
+    "gopher-44m": GPTConfig(n_layer=8, n_head=16, embd_dim=512),
+    # (there are a number more...)
+    # I made these tiny models up
+    "gpt-mini": GPTConfig(n_layer=6, n_head=6, embd_dim=192),
+    "gpt-micro": GPTConfig(n_layer=4, n_head=4, embd_dim=128),
+    "gpt-nano": GPTConfig(n_layer=3, n_head=3, embd_dim=48),
+}
+
+
 if __name__ == "__main__":
     block_size = 3
-    embed_dim = 12
+    embd_dim = 12
+    n_head = 3
     key = jax.random.PRNGKey(0)
     key, params_key, attn_pdrop_key, resid_pdrop_key = jax.random.split(key=key, num=4)
-    x = jax.random.normal(key, (1, block_size, embed_dim))  # B, T, C; or batch_size, sequence_length, embedding_dimensionality
+    x = jax.random.normal(key, (1, block_size, embd_dim))  # B, T, C; or batch_size, sequence_length, embedding_dimensionality
 
     # CausalSelfAttention Demo
-    attn = CausalSelfAttention(embed_dim=embed_dim, n_head=3, attn_pdrop=0.1, resid_pdrop=0.1, block_size=block_size)
+    attn_pdrop = 0.1
+    resid_pdrop = 0.1
+    attn = CausalSelfAttention(
+        embd_dim=embd_dim, n_head=n_head, attn_pdrop=attn_pdrop, resid_pdrop=resid_pdrop, block_size=block_size
+    )
     attn_params = attn.init(params_key, x, attn_pdrop_key, resid_pdrop_key)
     attn_y = attn.apply(attn_params, x, attn_pdrop_key, resid_pdrop_key)
 
     # Block Demo
-    block = Block(embed_dim=embed_dim, n_head=3, attn_pdrop=0.1, resid_pdrop=0.1, block_size=block_size)
+    block = Block(embd_dim=embd_dim, n_head=n_head, attn_pdrop=attn_pdrop, resid_pdrop=resid_pdrop, block_size=block_size)
     block_params = block.init(params_key, x, key)
     block_y = block.apply(block_params, x, key)
+
+    # GPT Demo
+    n_layer = 3
+    vocab_size = 10
+    gpt = GPT(
+        n_layer=n_layer,
+        n_head=n_head,
+        embd_dim=embd_dim,
+        vocab_size=vocab_size,
+        block_size=block_size,
+    )
+    x = jax.random.randint(key, (1, block_size), minval=0, maxval=vocab_size)  # B, T; or batch_size, sequence_length
+    gpt_params = gpt.init(params_key, x, x, key)
+    gpt_y = gpt.apply(gpt_params, x, x, key)
