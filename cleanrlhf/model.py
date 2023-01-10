@@ -60,8 +60,8 @@ class CausalSelfAttention(nn.Module):
         q = q.reshape(B, T, self.n_head, head_dim).swapaxes(1, 2)  # (B, nh, T, hd), nh: n_head, hd: head dimensionality
         k = k.reshape(B, T, self.n_head, head_dim).swapaxes(1, 2)  # (B, nh, T, hd)
         v = v.reshape(B, T, self.n_head, head_dim).swapaxes(1, 2)  # (B, nh, T, hd)
-        attn = q @ k.transpose(0, 1, 3, 2) / jnp.sqrt(head_dim)  # (B, nh, T, T), attention scores
-        attn = jnp.where(bias == 0, float("-inf"), attn)  # (B, nh, T, T), mask out the future tokens
+        attn = q @ k.swapaxes(-1, -2) / jnp.sqrt(head_dim)  # (B, nh, T, T), attention scores
+        attn = jnp.where(bias[:, :, :T, :T] == 0, float("-inf"), attn)  # (B, nh, T, T), mask out the future tokens
         attn = nn.softmax(attn, axis=-1)  # (B, nh, T, T), attention weights (probabilities)
         attn = dropout(attn, rate=self.attn_pdrop, key=attn_pdrop_key)
         y = attn @ v  # (B, nh, T, hd)
@@ -144,6 +144,8 @@ class GPT(nn.Module):
         x = nn.LayerNorm(self.c.embd_dim)(x)
         logits = nn.Dense(self.vocab_size, use_bias=False)(x)
 
+        if targets is None:
+            return logits, key
         # Costa: the following should be equivalent to `ignore_index=-1`
         # in F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         valid_targets = jnp.where(targets == -1, 0, targets)  # remove the mask from the integer labels for cross entropy
@@ -226,4 +228,6 @@ if __name__ == "__main__":
         block_size=11,
     )
     gpt_params = gpt.init(params_key, x, y, key)
-    gpt_loss, gpt_y, key = gpt.apply(gpt_params, x, y, key)
+    gpt_loss, (gpt_y, key) = gpt.apply(gpt_params, x, y, key)
+    x = jnp.array([[0, 1, 1, 2, 2, 1], [0, 1, 1, 2, 0, 2], [0, 1, 2, 2, 1, 0]])
+    gpt_loss, (gpt_y, key) = gpt.apply(gpt_params, x, x, key)

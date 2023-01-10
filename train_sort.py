@@ -8,6 +8,7 @@ from distutils.util import strtobool
 
 import hyperstate
 import jax
+import jax.numpy as jnp
 import numpy as np
 import optax
 import torch
@@ -168,7 +169,7 @@ if __name__ == "__main__":
     x = jax.random.randint(key, (1, block_size), minval=0, maxval=vocab_size)  # B, T; or batch_size, sequence_length
     y = jax.random.randint(key, (1, block_size), minval=0, maxval=vocab_size)  # B; or batch_size, sequence_length
     gpt_params = gpt.init(params_key, x, y, key)
-    gpt_y = gpt.apply(gpt_params, x, y, key)
+    gpt_loss, (gpt_y, key) = gpt.apply(gpt_params, x, y, key)
     train_state = TrainState.create(
         apply_fn=gpt.apply,
         params=gpt_params,
@@ -198,15 +199,42 @@ if __name__ == "__main__":
     iter_dt = 0.0
     data_iter = iter(train_loader)
 
-    # def loss(params, x, y, key):
-    #     loss, logits = train_state.apply_fn(params, x, x, key)
-    #     return loss
-
     @jax.jit
     def update(train_state: TrainState, x, y, key):
         (loss, (logits, key)), grads = jax.value_and_grad(train_state.apply_fn, has_aux=True)(train_state.params, x, y, key)
         train_state = train_state.apply_gradients(grads=grads)
         return train_state, (loss, logits, key)
+
+    def generate(train_state: TrainState, key, idx, max_new_tokens, temperature=1.0, do_sample=False, top_k=None):
+        """
+        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
+        the sequence max_new_tokens times, feeding the predictions back into the model each time.
+        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        """
+        for _ in range(max_new_tokens):
+            # if the sequence context is growing too long we must crop it at block_size
+            _, T = jnp.shape(idx)
+            idx_cond = idx if T <= block_size else idx[:, -block_size:]
+            # forward the model to get the logits for the index in the sequence
+            (logits, key) = train_state.apply_fn(train_state.params, idx_cond, None, key)
+            # pluck the logits at the final step and scale by desired temperature
+            logits = logits[:, -1, :] / temperature
+            # optionally crop the logits to only the top k options
+            if top_k is not None:
+                v, _ = jnp.topk(logits, top_k)
+                logits[logits < v[:, [-1]]] = -float("Inf")
+            # # apply softmax to convert logits to (normalized) probabilities
+            # probs = jax.nn.softmax(logits, axis=-1)
+            # either sample from the distribution or take the most likely element
+            if do_sample:
+                idx_next = jax.random.categorical(key, logits)
+                # idx_next = jnp.multinomial(probs, num_samples=1)
+            else:
+                _, idx_next = jax.lax.top_k(logits, k=1)
+            # append sampled index to the running sequence and continue
+            idx = jnp.concatenate((idx, idx_next), -1)
+
+        return idx
 
     while True:
         # fetch the next batch (x, y) and re-init iterator if needed
@@ -233,57 +261,50 @@ if __name__ == "__main__":
         if iter_num >= config.trainer.max_iters:
             break
 
-    # # create a Trainer object
-    # from mingpt.trainer import Trainer
-
-    # train_config = Trainer.get_default_config()
-    # train_config.learning_rate = 5e-4 # the model we're using is so small that we can go a bit faster
-    # train_config.max_iters = 2000
-    # train_config.num_workers = 0
-    # trainer = Trainer(train_config, model, train_dataset)
-
-    # def batch_end_callback(trainer):
-    #     if trainer.iter_num % 100 == 0:
-    #         print(f"iter_dt {trainer.iter_dt * 1000:.2f}ms; iter {trainer.iter_num}: train loss {trainer.loss.item():.5f}")
-    # trainer.set_callback('on_batch_end', batch_end_callback)
-
-    # trainer.run()
+    # n = train_dataset.length # naugy direct access shrug
+    # inp = jnp.array([[0, 0, 2, 1, 0, 1]], dtype=jnp.int32)
+    # cat = generate(train_state, key, inp, n, do_sample=False)
+    # sol = jnp.sort(inp[0])[0]
+    # sol_candidate = cat[:, n:]
+    # print('input sequence  :', inp)
+    # print('predicted sorted:', sol_candidate)
+    # print('gt sort         :', sol)
+    # print('matches         :', bool((sol == sol_candidate).all()))
 
     # # now let's perform some evaluation
     # model.eval()
 
-    # def eval_split(trainer, split, max_batches):
-    #     dataset = {'train':train_dataset, 'test':test_dataset}[split]
-    #     n = train_dataset.length # naugy direct access shrug
-    #     results = []
-    #     mistakes_printed_already = 0
-    #     loader = DataLoader(dataset, batch_size=100, num_workers=0, drop_last=False)
-    #     for b, (x, y) in enumerate(loader):
-    #         x = x.to(trainer.device)
-    #         y = y.to(trainer.device)
-    #         # isolate the input pattern alone
-    #         inp = x[:, :n]
-    #         sol = y[:, -n:]
-    #         # let the model sample the rest of the sequence
-    #         cat = model.generate(inp, n, do_sample=False) # using greedy argmax, not sampling
-    #         sol_candidate = cat[:, n:] # isolate the filled in sequence
-    #         # compare the predicted sequence to the true sequence
-    #         correct = (sol == sol_candidate).all(1).cpu() # Software 1.0 vs. Software 2.0 fight RIGHT on this line haha
-    #         for i in range(x.size(0)):
-    #             results.append(int(correct[i]))
-    #             if not correct[i] and mistakes_printed_already < 3: # only print up to 5 mistakes to get a sense
-    #                 mistakes_printed_already += 1
-    #                 print("GPT claims that %s sorted is %s but gt is %s" % (inp[i].tolist(), sol_candidate[i].tolist(), sol[i].tolist()))
-    #         if max_batches is not None and b+1 >= max_batches:
-    #             break
-    #     rt = torch.tensor(results, dtype=torch.float)
-    #     print("%s final score: %d/%d = %.2f%% correct" % (split, rt.sum(), len(results), 100*rt.mean()))
-    #     return rt.sum()
+    def eval_split(split, max_batches, key):
+        dataset = {"train": train_dataset, "test": test_dataset}[split]
+        n = train_dataset.length  # naugy direct access shrug
+        results = []
+        mistakes_printed_already = 0
+        loader = DataLoader(dataset, batch_size=100, num_workers=0, drop_last=False)
+        for b, (x, y) in enumerate(loader):
+            # isolate the input pattern alone
+            x, y = np.array(x), np.array(y)
+            inp = x[:, :n]
+            sol = y[:, -n:]
+            key, subkey = jax.random.split(key, 2)
+            # let the model sample the rest of the sequence
+            cat = generate(train_state, subkey, inp, n, do_sample=False)  # using greedy argmax, not sampling
+            sol_candidate = cat[:, n:]  # isolate the filled in sequence
+            # compare the predicted sequence to the true sequence
+            correct = (sol == sol_candidate).all(1)  # Software 1.0 vs. Software 2.0 fight RIGHT on this line haha
+            for i in range(len(x)):
+                results.append(int(correct[i]))
+                if not correct[i] and mistakes_printed_already < 3:  # only print up to 5 mistakes to get a sense
+                    mistakes_printed_already += 1
+                    print(f"GPT claims that {inp[i]} sorted is {sol_candidate[i]} but gt is {sol[i]}")
+            if max_batches is not None and b + 1 >= max_batches:
+                break
+        rt = jnp.array(results, dtype=jnp.float32)
+        print("%s final score: %d/%d = %.2f%% correct" % (split, rt.sum(), len(results), 100 * rt.mean()))
+        return rt.sum()
 
-    # # run a lot of examples from both train and test through the model and verify the output correctness
-    # with torch.no_grad():
-    #     train_score = eval_split(trainer, 'train', max_batches=50)
-    #     test_score  = eval_split(trainer, 'test',  max_batches=50)
+    # run a lot of examples from both train and test through the model and verify the output correctness
+    train_score = eval_split("train", max_batches=50, key=key)
+    test_score = eval_split("test", max_batches=50, key=key)
 
     # # let's run a random given sequence through the model as well
     # n = train_dataset.length # naugy direct access shrug
