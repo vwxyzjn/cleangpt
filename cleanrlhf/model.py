@@ -99,6 +99,7 @@ class Block(nn.Module):
         x = oldx + x
         return x
 
+
 @dataclass
 class GPTConfig:
     n_layer: int = 3
@@ -145,7 +146,7 @@ class GPT(nn.Module):
 
         # Costa: mask out the gradient for indices with values = -1
         # should be equivalent to `ignore_index=-1` in F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-        logits = jnp.where(jnp.expand_dims(targets, axis=-1) == -1, jnp.zeros_like(logits) -1e8 , logits)
+        logits = jnp.where(jnp.expand_dims(targets, axis=-1) == -1, -1e8, logits)
         loss = optax.softmax_cross_entropy_with_integer_labels(logits.reshape(-1, jnp.shape(logits)[-1]), targets.reshape(-1))
         return loss, logits
 
@@ -192,7 +193,7 @@ if __name__ == "__main__":
     # GPT Demo
     n_layer = 3
     vocab_size = 10
-    
+
     gpt = GPT(
         c=GPTConfig(
             n_layer=n_layer,
