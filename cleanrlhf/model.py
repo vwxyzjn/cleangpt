@@ -230,4 +230,4 @@ if __name__ == "__main__":
     gpt_params = gpt.init(params_key, x, y, key)
     gpt_loss, (gpt_y, key) = gpt.apply(gpt_params, x, y, key)
     x = jnp.array([[0, 1, 1, 2, 2, 1], [0, 1, 1, 2, 0, 2], [0, 1, 2, 2, 1, 0]])
-    gpt_loss, (gpt_y, key) = gpt.apply(gpt_params, x, x, key)
+    logits, key = gpt.apply(gpt_params, x, None, key)
