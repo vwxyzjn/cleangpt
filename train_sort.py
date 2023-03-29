@@ -1,4 +1,5 @@
 import argparse
+from functools import partial
 import os
 import pickle
 import random
@@ -205,36 +206,42 @@ if __name__ == "__main__":
         train_state = train_state.apply_gradients(grads=grads)
         return train_state, (loss, logits, key)
 
-    def generate(train_state: TrainState, key, idx, max_new_tokens, temperature=1.0, do_sample=False, top_k=None):
-        """
-        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
-        the sequence max_new_tokens times, feeding the predictions back into the model each time.
-        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
-        """
-        for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
-            _, T = jnp.shape(idx)
-            idx_cond = idx if T <= block_size else idx[:, -block_size:]
-            # forward the model to get the logits for the index in the sequence
-            (logits, key) = train_state.apply_fn(train_state.params, idx_cond, None, key)
-            # pluck the logits at the final step and scale by desired temperature
-            logits = logits[:, -1, :] / temperature
-            # optionally crop the logits to only the top k options
-            if top_k is not None:
-                v, _ = jnp.topk(logits, top_k)
-                logits[logits < v[:, [-1]]] = -float("Inf")
-            # # apply softmax to convert logits to (normalized) probabilities
-            # probs = jax.nn.softmax(logits, axis=-1)
-            # either sample from the distribution or take the most likely element
-            if do_sample:
-                idx_next = jax.random.categorical(key, logits)
-                # idx_next = jnp.multinomial(probs, num_samples=1)
-            else:
-                _, idx_next = jax.lax.top_k(logits, k=1)
-            # append sampled index to the running sequence and continue
-            idx = jnp.concatenate((idx, idx_next), -1)
+    def generate(train_state, key, input_tokens, max_new_tokens, temperature=1.0, top_k=None):
+        B, T = input_tokens.shape
+        padding = jnp.zeros((B, max_new_tokens), dtype=jnp.int32)
+        tokens = jnp.concatenate([input_tokens, padding], axis=-1)
+        indexes = jnp.arange(T, T + max_new_tokens)
 
-        return idx
+        # tokens index -> tokens None
+        def scan_f(tokens, i):
+            # l: x y
+            # t: a b - -
+            # i: 0 1 2 3
+            step_key = jax.random.fold_in(key, i)
+            # if the sequence context is growing too long we must crop it at block_size
+            # idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            # forward the model to get the logits for the index in the sequence
+            tokens[:, :block_size]
+            logits, _ = train_state.apply_fn(train_state.params, jax.lax.dynamic_slice(tokens, (0, 0), (B, block_size)), targets=None, key=step_key) #TODO: (0, 0) is going to be problematic
+            # pluck the logits at the final step and scale by desired temperature
+            logits = logits[:, i - 1, :] / temperature
+            # optionally crop the logits to only the top k options
+            # sample from the distribution
+            if top_k is not None:
+                top_logits, top_tokens = jax.lax.top_k(logits, min(top_k, logits.shape[-1]))
+                token_idx = jax.random.categorical(step_key, top_logits, axis=-1)
+                next_token = jnp.take_along_axis(top_tokens, token_idx[:, None], axis=-1).squeeze(-1)
+            else:
+                next_token = jax.random.categorical(step_key, logits, axis=-1)
+                # logits = jnp.where(logits < v[:, -1:], float('-inf'), logits)
+            # append sampled index to the running sequence and continue
+            tokens = tokens.at[:, i].set(next_token)
+
+            return tokens, None
+
+        tokens, _ = jax.lax.scan(scan_f, tokens, indexes)
+
+        return tokens
 
     while True:
         # fetch the next batch (x, y) and re-init iterator if needed
@@ -256,6 +263,7 @@ if __name__ == "__main__":
         tnow = time.time()
         iter_dt = tnow - iter_time
         iter_time = tnow
+        # break
 
         # termination conditions
         if iter_num >= config.trainer.max_iters:
@@ -263,8 +271,8 @@ if __name__ == "__main__":
 
     # n = train_dataset.length # naugy direct access shrug
     # inp = jnp.array([[0, 0, 2, 1, 0, 1]], dtype=jnp.int32)
-    # cat = generate(train_state, key, inp, n, do_sample=False)
-    # sol = jnp.sort(inp[0])[0]
+    # cat = generate(train_state, key, inp, n)
+    # sol = jnp.sort(inp)
     # sol_candidate = cat[:, n:]
     # print('input sequence  :', inp)
     # print('predicted sorted:', sol_candidate)
@@ -287,7 +295,7 @@ if __name__ == "__main__":
             sol = y[:, -n:]
             key, subkey = jax.random.split(key, 2)
             # let the model sample the rest of the sequence
-            cat = generate(train_state, subkey, inp, n, do_sample=False)  # using greedy argmax, not sampling
+            cat = generate(train_state, subkey, inp, n, top_k=1)  # using greedy argmax, not sampling
             sol_candidate = cat[:, n:]  # isolate the filled in sequence
             # compare the predicted sequence to the true sequence
             correct = (sol == sol_candidate).all(1)  # Software 1.0 vs. Software 2.0 fight RIGHT on this line haha
@@ -306,15 +314,3 @@ if __name__ == "__main__":
     train_score = eval_split("train", max_batches=50, key=key)
     test_score = eval_split("test", max_batches=50, key=key)
 
-    # # let's run a random given sequence through the model as well
-    # n = train_dataset.length # naugy direct access shrug
-    # inp = torch.tensor([[0, 0, 2, 1, 0, 1]], dtype=torch.long).to(trainer.device)
-    # assert inp[0].nelement() == n
-    # with torch.no_grad():
-    #     cat = model.generate(inp, n, do_sample=False)
-    # sol = torch.sort(inp[0])[0]
-    # sol_candidate = cat[:, n:]
-    # print('input sequence  :', inp.tolist())
-    # print('predicted sorted:', sol_candidate.tolist())
-    # print('gt sort         :', sol.tolist())
-    # print('matches         :', bool((sol == sol_candidate).all()))

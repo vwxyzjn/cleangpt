@@ -1,4 +1,8 @@
-# cleanrlhf
+# CleanRLHF
+
+This is an experimental repository for me to learn more about Transformers, GPT, and RLHF. 
+
+## Get Started
 
 ```
 poetry install
