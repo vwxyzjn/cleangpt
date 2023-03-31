@@ -7,16 +7,19 @@ from dataclasses import dataclass
 from distutils.util import strtobool
 
 import hyperstate
+import urllib.request
 import jax
+import requests
 import jax.numpy as jnp
 import numpy as np
 import optax
 import torch
+from torch.utils.data import Dataset
 from flax.training.train_state import TrainState
 from torch.utils.data.dataloader import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-from cleanrlhf.model import GPT, GPTConfig
+from cleanrlhf.model import GPT, GPTConfig, MODELS_PRESET
 
 os.environ[
     "XLA_PYTHON_CLIENT_MEM_FRACTION"
@@ -32,10 +35,13 @@ def parse_args():
         help="seed of the experiment")
     parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if toggled, this experiment will be tracked with Weights and Biases")
-    parser.add_argument("--wandb-project-name", type=str, default="cleanRL",
+    parser.add_argument("--wandb-project-name", type=str, default="cleanrlhf",
         help="the wandb's project name")
     parser.add_argument("--wandb-entity", type=str, default=None,
         help="the entity (team) of wandb's project")
+
+    parser.add_argument("--model-type", type=str, default="gpt-mini",
+        help="the type of model")
     parser.add_argument("--config", type=str, default=None, help="Path to config file")
     parser.add_argument("--hps", nargs="+", help="Override hyperparameter value")
     args = parser.parse_args()
@@ -45,14 +51,13 @@ def parse_args():
 
 @dataclass
 class TrainerConfig:
-    max_iters = None
     batch_size = 64
     learning_rate = 5e-4
     betas = (0.9, 0.95)
     weight_decay = 0.1  # only applied on matmul weights
     grad_norm_clip = 1.0
     num_workers = 0
-    max_iters = 2000
+    max_iters = 20000
 
 
 @dataclass
@@ -61,64 +66,43 @@ class Config:
     trainer: TrainerConfig
 
 
-class SortDataset:
+# -----------------------------------------------------------------------------
+
+class CharDataset(Dataset):
     """
-    Dataset for the Sort problem. E.g. for problem length 6:
-    Input: 0 0 2 1 0 1 -> Output: 0 0 0 1 1 2
-    Which will feed into the transformer concatenated as:
-    input:  0 0 2 1 0 1 0 0 0 1 1
-    output: I I I I I 0 0 0 1 1 2
-    where I is "ignore", as the transformer is reading the input sequence
+    Emits batches of characters
     """
 
-    def __init__(self, split, length=6, num_digits=3):
-        assert split in {"train", "test"}
-        self.split = split
-        self.length = length
-        self.num_digits = num_digits
 
-    def __len__(self):
-        return 10000  # ...
+    def __init__(self, block_size, data):
+        self.block_size = block_size
+
+        chars = sorted(list(set(data)))
+        data_size, vocab_size = len(data), len(chars)
+        print('data has %d characters, %d unique.' % (data_size, vocab_size))
+
+        self.stoi = { ch:i for i,ch in enumerate(chars) }
+        self.itos = { i:ch for i,ch in enumerate(chars) }
+        self.vocab_size = vocab_size
+        self.data = data
 
     def get_vocab_size(self):
-        return self.num_digits
+        return self.vocab_size
 
     def get_block_size(self):
-        # the length of the sequence that will feed into transformer,
-        # containing concatenated input and the output, but -1 because
-        # the transformer starts making predictions at the last input element
-        return self.length * 2 - 1
+        return self.block_size
+
+    def __len__(self):
+        return len(self.data) - self.block_size
 
     def __getitem__(self, idx):
-
-        # use rejection sampling to generate an input example from the desired split
-        while True:
-            # generate some random integers
-            inp = torch.randint(self.num_digits, size=(self.length,), dtype=torch.long)
-            # half of the time let's try to boost the number of examples that
-            # have a large number of repeats, as this is what the model seems to struggle
-            # with later in training, and they are kind of rate
-            if torch.rand(1).item() < 0.5:
-                if inp.unique().nelement() > self.length // 2:
-                    # too many unique digits, re-sample
-                    continue
-            # figure out if this generated example is train or test based on its hash
-            h = hash(pickle.dumps(inp.tolist()))
-            inp_split = "test" if h % 4 == 0 else "train"  # designate 25% of examples as test
-            if inp_split == self.split:
-                break  # ok
-
-        # solve the task: i.e. sort
-        sol = torch.sort(inp)[0]
-
-        # concatenate the problem specification and the solution
-        cat = torch.cat((inp, sol), dim=0)
-
-        # the inputs to the transformer will be the offset sequence
-        x = cat[:-1].clone()
-        y = cat[1:].clone()
-        # we only want to predict at output locations, mask out the loss at the input locations
-        y[: self.length - 1] = -1
+        # grab a chunk of (block_size + 1) characters from the data
+        chunk = self.data[idx:idx + self.block_size + 1]
+        # encode every character to an integer
+        dix = [self.stoi[s] for s in chunk]
+        # return as tensors
+        x = torch.tensor(dix[:-1], dtype=torch.long)
+        y = torch.tensor(dix[1:], dtype=torch.long)
         return x, y
 
 
@@ -136,7 +120,6 @@ if __name__ == "__main__":
             sync_tensorboard=True,
             config=vars(args),
             name=run_name,
-            monitor_gym=True,
             save_code=True,
         )
     writer = SummaryWriter(f"runs/{run_name}")
@@ -151,18 +134,26 @@ if __name__ == "__main__":
     key = jax.random.PRNGKey(args.seed)
     key, params_key, actor_key, critic_key = jax.random.split(key, 4)
 
-    # set up dataset
-    train_dataset = SortDataset("train")
-    test_dataset = SortDataset("test")
-    x, y = train_dataset[0]
-    for a, b in zip(x, y):
-        print(int(a), int(b))
+    # construct the training dataset
+    if not os.path.exists("tinyshakespeare.txt"):
+        urllib.request.urlretrieve(
+            "https://github.com/karpathy/char-rnn/raw/6f9487a6fe5b420b7ca9afb0d7c078e37c1d1b4e/data/tinyshakespeare/input.txt",
+            "tinyshakespeare.txt",
+        )
+    text = open('tinyshakespeare.txt', 'r').read() # don't worry we won't run out of file handles
+    train_dataset = CharDataset(block_size = 128, data=text)
+
     vocab_size = train_dataset.get_vocab_size()
     block_size = train_dataset.get_block_size()
 
     # initialize model
+    gpt_config = config.gpt
+    if args.model_type:
+        assert args.model_type in MODELS_PRESET, f"model_type {args.model_type} not found in {MODELS_PRESET.keys()}"
+        gpt_config = MODELS_PRESET[args.model_type]
+
     gpt = GPT(
-        c=config.gpt,
+        c=gpt_config,
         vocab_size=vocab_size,
         block_size=block_size,
     )
@@ -261,57 +252,27 @@ if __name__ == "__main__":
         if iter_num % 100 == 0:
             print(f"iter_dt {iter_dt * 1000:.2f}ms; iter {iter_num}: train loss {loss.item():.5f}")
 
+        if iter_num % 500 == 0:
+            eval_len = 500
+
+            # sample from the model...
+            context = "O God, O God!"
+            key, subkey = jax.random.split(key, 2)
+            x = np.array([train_dataset.stoi[s] for s in context], dtype=np.int32)[None,...]
+            y = generate(train_state, subkey, x, eval_len, temperature=0.9, top_k=5)[0][:len(x[0]) + eval_len]
+            completion = ''.join([train_dataset.itos[int(i)] for i in y])
+            print(len(completion), completion)
+            # # save the latest model
+            # print("saving model")
+            # ckpt_path = os.path.join(config.system.work_dir, "model.pt")
+            # torch.save(model.state_dict(), ckpt_path)
+
         iter_num += 1
         tnow = time.time()
         iter_dt = tnow - iter_time
         iter_time = tnow
-        # break
 
         # termination conditions
         if iter_num >= config.trainer.max_iters:
             break
 
-    # n = train_dataset.length # naugy direct access shrug
-    # inp = jnp.array([[0, 0, 2, 1, 0, 1]], dtype=jnp.int32)
-    # cat = generate(train_state, key, inp, n)
-    # sol = jnp.sort(inp)
-    # sol_candidate = cat[:, n:]
-    # print('input sequence  :', inp)
-    # print('predicted sorted:', sol_candidate)
-    # print('gt sort         :', sol)
-    # print('matches         :', bool((sol == sol_candidate).all()))
-
-    # # now let's perform some evaluation
-    # model.eval()
-
-    def eval_split(split, max_batches, key):
-        dataset = {"train": train_dataset, "test": test_dataset}[split]
-        n = train_dataset.length  # naugy direct access shrug
-        results = []
-        mistakes_printed_already = 0
-        loader = DataLoader(dataset, batch_size=100, num_workers=0, drop_last=False)
-        for b, (x, y) in enumerate(loader):
-            # isolate the input pattern alone
-            x, y = np.array(x), np.array(y)
-            inp = x[:, :n]
-            sol = y[:, -n:]
-            key, subkey = jax.random.split(key, 2)
-            # let the model sample the rest of the sequence
-            cat = generate(train_state, subkey, inp, n, top_k=1)  # using greedy argmax, not sampling
-            sol_candidate = cat[:, n:]  # isolate the filled in sequence
-            # compare the predicted sequence to the true sequence
-            correct = (sol == sol_candidate).all(1)  # Software 1.0 vs. Software 2.0 fight RIGHT on this line haha
-            for i in range(len(x)):
-                results.append(int(correct[i]))
-                if not correct[i] and mistakes_printed_already < 3:  # only print up to 5 mistakes to get a sense
-                    mistakes_printed_already += 1
-                    print(f"GPT claims that {inp[i]} sorted is {sol_candidate[i]} but gt is {sol[i]}")
-            if max_batches is not None and b + 1 >= max_batches:
-                break
-        rt = jnp.array(results, dtype=jnp.float32)
-        print("%s final score: %d/%d = %.2f%% correct" % (split, rt.sum(), len(results), 100 * rt.mean()))
-        return rt.sum()
-
-    # run a lot of examples from both train and test through the model and verify the output correctness
-    train_score = eval_split("train", max_batches=50, key=key)
-    test_score = eval_split("test", max_batches=50, key=key)
