@@ -19,7 +19,7 @@ from flax.training.train_state import TrainState
 from torch.utils.data.dataloader import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-from cleanrlhf.model import GPT, GPTConfig, MODELS_PRESET #, param_decay_mask
+from cleanrlhf.model import GPT, GPTConfig, MODELS_PRESET, param_decay_mask
 
 os.environ[
     "XLA_PYTHON_CLIENT_MEM_FRACTION"
@@ -40,7 +40,7 @@ def parse_args():
     parser.add_argument("--wandb-entity", type=str, default=None,
         help="the entity (team) of wandb's project")
 
-    parser.add_argument("--model-type", type=str, default="gpt-mini",
+    parser.add_argument("--model-type", type=str, default=None,
         help="the type of model")
     parser.add_argument("--config", type=str, default=None, help="Path to config file")
     parser.add_argument("--hps", nargs="+", help="Override hyperparameter value")
@@ -49,16 +49,25 @@ def parse_args():
     return args
 
 
+@dataclass(frozen=True)
+class CosineDecayScheduleConfig:
+    init_value: float = 0.0001
+    peak_value: float = 0.001
+    warmup_steps: int = 250
+    decay_steps: int = 5000
+    end_value: float = 0.0001
+
+
 @dataclass
 class TrainerConfig:
     batch_size = 64
-    learning_rate = 0.0005
-    betas = (0.9, 0.95)
+    learning_rate: CosineDecayScheduleConfig = field(default_factory=CosineDecayScheduleConfig)
+    betas = (0.9, 0.99)
     weight_decay = 0.1  # only applied on matmul weights
     grad_norm_clip = 1.0
     num_workers = 0
     max_iters = 10000
-    # gradient_accumulation_steps: int = 5    # used to simulate larger batch sizes
+    gradient_accumulation_steps: int = 5    # used to simulate larger batch sizes
 
 @dataclass
 class Config:
@@ -109,11 +118,6 @@ class CharDataset(Dataset):
 if __name__ == "__main__":
     args = parse_args()
     config = hyperstate.load(Config, file=args.config, overrides=args.hps)
-    gpt_config = config.gpt
-    if args.model_type:
-        assert args.model_type in MODELS_PRESET, f"model_type {args.model_type} not found in {MODELS_PRESET.keys()}"
-        gpt_config = MODELS_PRESET[args.model_type]
-    config.gpt = gpt_config
     print(config)
     run_name = f"{args.exp_name}__{args.seed}__{int(time.time())}"
     if args.track:
@@ -146,32 +150,50 @@ if __name__ == "__main__":
             "tinyshakespeare.txt",
         )
     text = open('tinyshakespeare.txt', 'r').read() # don't worry we won't run out of file handles
-    train_dataset = CharDataset(block_size=128, data=text)
+    train_dataset = CharDataset(block_size=256, data=text)
 
     vocab_size = train_dataset.get_vocab_size()
     block_size = train_dataset.get_block_size()
 
     # initialize model
+    gpt_config = config.gpt
+    # if args.model_type:
+    #     assert args.model_type in MODELS_PRESET, f"model_type {args.model_type} not found in {MODELS_PRESET.keys()}"
+    #     gpt_config = MODELS_PRESET[args.model_type]
+
+    gpt_config = GPTConfig(
+        n_layer=6,
+        n_head=6,
+        embd_dim=384,
+        embd_pdrop=0.2,
+        resid_pdrop=0.2,
+        attn_pdrop=0.2,
+        bias=False,
+    )
+
     gpt = GPT(
-        config=config.gpt,
+        c=gpt_config,
         vocab_size=vocab_size,
         block_size=block_size,
     )
     x = jax.random.randint(key, (1, block_size), minval=0, maxval=vocab_size)  # B, T; or batch_size, sequence_length
     y = jax.random.randint(key, (1, block_size), minval=0, maxval=vocab_size)  # B; or batch_size, sequence_length
-    gpt_params = gpt.init(params_key, x, y, deterministic=True)
-    print(gpt.tabulate(key, x, y, deterministic=True))
-    gpt_loss, (gpt_y) = gpt.apply(gpt_params, x, y, deterministic=True)
+    gpt_params = gpt.init(params_key, x, y, key)
+    print(gpt.tabulate(key, x, y, key))
+    gpt_loss, (gpt_y, key) = gpt.apply(gpt_params, x, y, key)
     train_state = TrainState.create(
         apply_fn=gpt.apply,
         params=gpt_params,
         tx=optax.chain(
             optax.clip_by_global_norm(config.trainer.grad_norm_clip),
             optax.inject_hyperparams(optax.adamw)(
-                config.trainer.learning_rate,
+                learning_rate=optax.warmup_cosine_decay_schedule(**asdict(config.trainer.learning_rate)),
+                # learning_rate=get_lr,
                 b1=config.trainer.betas[0],
                 b2=config.trainer.betas[1],
+                mask=param_decay_mask(gpt_params),
             ),
+            optax.apply_every(config.trainer.gradient_accumulation_steps),
         ),
     )
 
@@ -193,10 +215,9 @@ if __name__ == "__main__":
 
     @jax.jit
     def update(train_state: TrainState, x, y, key):
-        dropout_key = jax.random.fold_in(key, train_state.step)
-        (loss, logits), grads = jax.value_and_grad(train_state.apply_fn, has_aux=True)(train_state.params, x, y, deterministic=False, rngs={'dropout': dropout_key})
+        (loss, (logits, key)), grads = jax.value_and_grad(train_state.apply_fn, has_aux=True)(train_state.params, x, y, key)
         train_state = train_state.apply_gradients(grads=grads)
-        return train_state, (loss, logits)
+        return train_state, (loss, logits, key)
 
     def generate(train_state, key, input_tokens, max_new_tokens, temperature=1.0, top_k=None):
         B, T = input_tokens.shape
@@ -215,8 +236,8 @@ if __name__ == "__main__":
             # if the sequence context is growing too long we must crop it at block_size
             # idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits = train_state.apply_fn(
-                train_state.params, jax.lax.dynamic_slice(tokens, (0, start_i), (B, block_size)), targets=None, deterministic=False, rngs={'dropout': step_key}
+            logits, _ = train_state.apply_fn(
+                train_state.params, jax.lax.dynamic_slice(tokens, (0, start_i), (B, block_size)), targets=None, key=step_key
             )  # TODO: (0, 0) is going to be problematic
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, i - 1, :] / temperature
@@ -249,10 +270,9 @@ if __name__ == "__main__":
         x, y = batch
         # raise
 
-        train_state, (loss, logits) = update(train_state, x, y, key)
+        train_state, (loss, logits, key) = update(train_state, x, y, key)
 
         writer.add_scalar("train/loss", loss.item(), iter_num)
-        writer.add_scalar("charts/learning_rate", train_state.opt_state[1].hyperparams["learning_rate"].item(), iter_num)
         if iter_num % 100 == 0:
             print(f"iter_dt {iter_dt * 1000:.2f}ms; iter {iter_num}: train loss {loss.item():.5f}")
 
@@ -270,6 +290,8 @@ if __name__ == "__main__":
             # print("saving model")
             # ckpt_path = os.path.join(config.system.work_dir, "model.pt")
             # torch.save(model.state_dict(), ckpt_path)
+
+        writer.add_scalar("charts/learning_rate", train_state.opt_state[1].hyperparams["learning_rate"].item(), iter_num)
 
         iter_num += 1
         tnow = time.time()
