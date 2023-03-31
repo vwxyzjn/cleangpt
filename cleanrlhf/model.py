@@ -5,7 +5,6 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import optax
-import flax
 
 
 def dropout(x: jnp.ndarray, rate: float, key: jax.random.KeyArray) -> jnp.ndarray:
@@ -53,7 +52,7 @@ class CausalSelfAttention(nn.Module):
 
     @nn.compact
     def __call__(self, x: jnp.array, deterministic=None):
-        deterministic = nn.merge_param('deterministic', self.deterministic, deterministic)
+        deterministic = nn.merge_param("deterministic", self.deterministic, deterministic)
         assert self.embd_dim % self.n_head == 0, "embd_dim must be divisible by num_heads"
         B, T, C = jnp.shape(x)  # batch size, sequence length, embedding dimensionality (embd_dim
         head_dim = C // self.n_head  # alias: hd
@@ -72,7 +71,7 @@ class CausalSelfAttention(nn.Module):
         y = attn @ v  # (B, nh, T, hd)
         y = y.swapaxes(1, 2)  # (B, T, nh, hd)
         y = y.reshape(B, T, C)  # (B, T, C)
-        c_proj = nn.Dense(C, use_bias=self.use_bias)(y) # (B, T, C)
+        c_proj = nn.Dense(C, use_bias=self.use_bias)(y)  # (B, T, C)
         x = nn.Dropout(rate=self.resid_pdrop)(c_proj, deterministic=deterministic)
         return x
 
@@ -87,11 +86,12 @@ class MLP(nn.Module):
     @nn.compact
     def __call__(self, x, deterministic=None):
         B, T, C = x.shape
-        x = nn.Dense(4 * C, use_bias=self.use_bias, name='c_fc')(x)
+        x = nn.Dense(4 * C, use_bias=self.use_bias, name="c_fc")(x)
         x = nn.gelu(x, approximate=True)
-        x = nn.Dense(C, use_bias=self.use_bias, name='c_proj')(x)
+        x = nn.Dense(C, use_bias=self.use_bias, name="c_proj")(x)
         x = nn.Dropout(self.resid_pdrop)(x, deterministic)
         return x
+
 
 class Block(nn.Module):
     embd_dim: int  # alias: C
@@ -104,7 +104,9 @@ class Block(nn.Module):
 
     def setup(self):
         self.ln_1 = nn.LayerNorm(epsilon=1e-5, dtype=self.dtype, use_bias=self.use_bias)
-        self.attn = CausalSelfAttention(self.embd_dim, self.n_head, self.attn_pdrop, self.resid_pdrop, self.block_size, self.use_bias, dtype=self.dtype)
+        self.attn = CausalSelfAttention(
+            self.embd_dim, self.n_head, self.attn_pdrop, self.resid_pdrop, self.block_size, self.use_bias, dtype=self.dtype
+        )
         self.ln_2 = nn.LayerNorm(epsilon=1e-5, dtype=self.dtype, use_bias=self.use_bias)
         self.mlp = MLP(self.n_head, self.attn_pdrop, self.resid_pdrop, self.block_size, self.use_bias)
 
@@ -112,7 +114,7 @@ class Block(nn.Module):
         x = x + self.attn(self.ln_1(x), deterministic)
         x = x + self.mlp(self.ln_2(x), deterministic)
         return x
-    
+
 
 @dataclass(frozen=True)
 class GPTConfig:
@@ -138,10 +140,10 @@ class GPT(nn.Module):
     def __call__(self, idx, targets: jnp.array, deterministic=None):
         _, T = jnp.shape(idx)  # B, T
         assert T <= self.block_size, f"Cannot forward sequence of length {T}, block size is only {self.block_size}"
-        pos = jnp.arange(0, T)[None]   # shape (1, T)
+        pos = jnp.arange(0, T)[None]  # shape (1, T)
 
-        wte = nn.Embed(self.vocab_size, self.config.embd_dim, dtype=self.config.dtype, name='wte')
-        wpe = nn.Embed(self.block_size, self.config.embd_dim, dtype=self.config.dtype, name='wpe')
+        wte = nn.Embed(self.vocab_size, self.config.embd_dim, dtype=self.config.dtype, name="wte")
+        wpe = nn.Embed(self.block_size, self.config.embd_dim, dtype=self.config.dtype, name="wpe")
 
         token_embed = wte(idx)  # token embeddings of shape (B, T, embd_dim)
         pos_embed = wpe(pos)  # position embeddings of shape (1, T, embd_dim)
@@ -159,7 +161,7 @@ class GPT(nn.Module):
                 name=str(i),
             )(x, deterministic=deterministic)
 
-        x = nn.LayerNorm(1e-5, dtype=self.config.dtype, use_bias=self.config.use_bias, name='ln_f')(x)
+        x = nn.LayerNorm(1e-5, dtype=self.config.dtype, use_bias=self.config.use_bias, name="ln_f")(x)
         logits = wte.attend(x)
         if targets is None:
             return logits
@@ -210,14 +212,21 @@ if __name__ == "__main__":
     attn_pdrop = 0.1
     resid_pdrop = 0.1
     attn = CausalSelfAttention(
-        embd_dim=embd_dim, n_head=n_head, attn_pdrop=attn_pdrop, resid_pdrop=resid_pdrop, block_size=block_size, use_bias=False,
+        embd_dim=embd_dim,
+        n_head=n_head,
+        attn_pdrop=attn_pdrop,
+        resid_pdrop=resid_pdrop,
+        block_size=block_size,
+        use_bias=False,
     )
     attn_params = attn.init(params_key, x, deterministic=True)
     attn_y = attn.apply(attn_params, x, deterministic=True)
-    attn_y = attn.apply(attn_params, x, deterministic=False, rngs={'dropout': dropout_key})
+    attn_y = attn.apply(attn_params, x, deterministic=False, rngs={"dropout": dropout_key})
 
     # Block Demo
-    block = Block(embd_dim=embd_dim, n_head=n_head, attn_pdrop=attn_pdrop, resid_pdrop=resid_pdrop, block_size=block_size, use_bias=False)
+    block = Block(
+        embd_dim=embd_dim, n_head=n_head, attn_pdrop=attn_pdrop, resid_pdrop=resid_pdrop, block_size=block_size, use_bias=False
+    )
     block_params = block.init(params_key, x, deterministic=True)
     block_y = block.apply(block_params, x, deterministic=True)
 

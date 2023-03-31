@@ -16,7 +16,7 @@ from flax.training.train_state import TrainState
 from torch.utils.data.dataloader import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-from cleanrlhf.model import GPT, GPTConfig, MODELS_PRESET
+from cleanrlhf.model import GPT, MODELS_PRESET, GPTConfig
 
 os.environ[
     "XLA_PYTHON_CLIENT_MEM_FRACTION"
@@ -208,7 +208,9 @@ if __name__ == "__main__":
     @jax.jit
     def update(train_state: TrainState, x, y, key):
         dropout_key = jax.random.fold_in(key, train_state.step)
-        (loss, logits), grads = jax.value_and_grad(train_state.apply_fn, has_aux=True)(train_state.params, x, y, deterministic=False, rngs={'dropout': dropout_key})
+        (loss, logits), grads = jax.value_and_grad(train_state.apply_fn, has_aux=True)(
+            train_state.params, x, y, deterministic=False, rngs={"dropout": dropout_key}
+        )
         train_state = train_state.apply_gradients(grads=grads)
         return train_state, (loss, logits)
 
@@ -230,7 +232,11 @@ if __name__ == "__main__":
             # idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
             logits = train_state.apply_fn(
-                train_state.params, jax.lax.dynamic_slice(tokens, (0, start_i), (B, block_size)), targets=None, deterministic=False, rngs={'dropout': step_key}
+                train_state.params,
+                jax.lax.dynamic_slice(tokens, (0, start_i), (B, block_size)),
+                targets=None,
+                deterministic=False,
+                rngs={"dropout": step_key},
             )  # TODO: (0, 0) is going to be problematic
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, i - 1, :] / temperature
@@ -279,15 +285,15 @@ if __name__ == "__main__":
         if iter_num >= config.trainer.max_iters:
             break
 
-    n = train_dataset.length # naugy direct access shrug
+    n = train_dataset.length  # naugy direct access shrug
     inp = jnp.array([[0, 0, 2, 1, 0, 1]], dtype=jnp.int32)
     cat = generate(train_state, key, inp, n)
     sol = jnp.sort(inp)
     sol_candidate = cat[:, n:]
-    print('input sequence  :', inp)
-    print('predicted sorted:', sol_candidate)
-    print('gt sort         :', sol)
-    print('matches         :', bool((sol == sol_candidate).all()))
+    print("input sequence  :", inp)
+    print("predicted sorted:", sol_candidate)
+    print("gt sort         :", sol)
+    print("matches         :", bool((sol == sol_candidate).all()))
 
     def eval_split(split, max_batches, key):
         dataset = {"train": train_dataset, "test": test_dataset}[split]

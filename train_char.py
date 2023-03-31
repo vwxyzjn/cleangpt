@@ -1,25 +1,23 @@
 import argparse
 import os
-import pickle
 import random
 import time
-from dataclasses import dataclass, field, asdict
+import urllib.request
+from dataclasses import dataclass
 from distutils.util import strtobool
 
 import hyperstate
-import urllib.request
 import jax
-import requests
 import jax.numpy as jnp
 import numpy as np
 import optax
 import torch
-from torch.utils.data import Dataset
 from flax.training.train_state import TrainState
+from torch.utils.data import Dataset
 from torch.utils.data.dataloader import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-from cleanrlhf.model import GPT, GPTConfig, MODELS_PRESET
+from cleanrlhf.model import GPT, MODELS_PRESET, GPTConfig
 
 os.environ[
     "XLA_PYTHON_CLIENT_MEM_FRACTION"
@@ -59,6 +57,7 @@ class TrainerConfig:
     max_iters = 10000
     # gradient_accumulation_steps: int = 5    # used to simulate larger batch sizes
 
+
 @dataclass
 class Config:
     gpt: GPTConfig
@@ -67,21 +66,21 @@ class Config:
 
 # -----------------------------------------------------------------------------
 
+
 class CharDataset(Dataset):
     """
     Emits batches of characters
     """
-
 
     def __init__(self, block_size, data):
         self.block_size = block_size
 
         chars = sorted(list(set(data)))
         data_size, vocab_size = len(data), len(chars)
-        print('data has %d characters, %d unique.' % (data_size, vocab_size))
+        print("data has %d characters, %d unique." % (data_size, vocab_size))
 
-        self.stoi = { ch:i for i,ch in enumerate(chars) }
-        self.itos = { i:ch for i,ch in enumerate(chars) }
+        self.stoi = {ch: i for i, ch in enumerate(chars)}
+        self.itos = {i: ch for i, ch in enumerate(chars)}
         self.vocab_size = vocab_size
         self.data = data
 
@@ -96,7 +95,7 @@ class CharDataset(Dataset):
 
     def __getitem__(self, idx):
         # grab a chunk of (block_size + 1) characters from the data
-        chunk = self.data[idx:idx + self.block_size + 1]
+        chunk = self.data[idx : idx + self.block_size + 1]
         # encode every character to an integer
         dix = [self.stoi[s] for s in chunk]
         # return as tensors
@@ -144,7 +143,7 @@ if __name__ == "__main__":
             "https://github.com/karpathy/char-rnn/raw/6f9487a6fe5b420b7ca9afb0d7c078e37c1d1b4e/data/tinyshakespeare/input.txt",
             "tinyshakespeare.txt",
         )
-    text = open('tinyshakespeare.txt', 'r').read() # don't worry we won't run out of file handles
+    text = open("tinyshakespeare.txt").read()  # don't worry we won't run out of file handles
     train_dataset = CharDataset(block_size=128, data=text)
 
     vocab_size = train_dataset.get_vocab_size()
@@ -193,7 +192,9 @@ if __name__ == "__main__":
     @jax.jit
     def update(train_state: TrainState, x, y, key):
         dropout_key = jax.random.fold_in(key, train_state.step)
-        (loss, logits), grads = jax.value_and_grad(train_state.apply_fn, has_aux=True)(train_state.params, x, y, deterministic=False, rngs={'dropout': dropout_key})
+        (loss, logits), grads = jax.value_and_grad(train_state.apply_fn, has_aux=True)(
+            train_state.params, x, y, deterministic=False, rngs={"dropout": dropout_key}
+        )
         train_state = train_state.apply_gradients(grads=grads)
         return train_state, (loss, logits)
 
@@ -215,7 +216,11 @@ if __name__ == "__main__":
             # idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
             logits = train_state.apply_fn(
-                train_state.params, jax.lax.dynamic_slice(tokens, (0, start_i), (B, block_size)), targets=None, deterministic=False, rngs={'dropout': step_key}
+                train_state.params,
+                jax.lax.dynamic_slice(tokens, (0, start_i), (B, block_size)),
+                targets=None,
+                deterministic=False,
+                rngs={"dropout": step_key},
             )  # TODO: (0, 0) is going to be problematic
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, i - 1, :] / temperature
@@ -261,9 +266,9 @@ if __name__ == "__main__":
             # sample from the model...
             context = "O God, O God!"
             key, subkey = jax.random.split(key, 2)
-            x = np.array([train_dataset.stoi[s] for s in context], dtype=np.int32)[None,...]
-            y = generate(train_state, subkey, x, eval_len, temperature=0.9, top_k=5)[0][:len(x[0]) + eval_len]
-            completion = ''.join([train_dataset.itos[int(i)] for i in y])
+            x = np.array([train_dataset.stoi[s] for s in context], dtype=np.int32)[None, ...]
+            y = generate(train_state, subkey, x, eval_len, temperature=0.9, top_k=5)[0][: len(x[0]) + eval_len]
+            completion = "".join([train_dataset.itos[int(i)] for i in y])
             print(len(completion), completion)
             # # save the latest model
             # print("saving model")
@@ -278,4 +283,3 @@ if __name__ == "__main__":
         # termination conditions
         if iter_num >= config.trainer.max_iters:
             break
-
