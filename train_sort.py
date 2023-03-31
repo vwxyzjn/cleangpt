@@ -16,7 +16,7 @@ from flax.training.train_state import TrainState
 from torch.utils.data.dataloader import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-from cleanrlhf.model import GPT, GPTConfig
+from cleanrlhf.model import GPT, GPTConfig, MODELS_PRESET
 
 os.environ[
     "XLA_PYTHON_CLIENT_MEM_FRACTION"
@@ -32,10 +32,12 @@ def parse_args():
         help="seed of the experiment")
     parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if toggled, this experiment will be tracked with Weights and Biases")
-    parser.add_argument("--wandb-project-name", type=str, default="cleanRL",
+    parser.add_argument("--wandb-project-name", type=str, default="cleanrlhf",
         help="the wandb's project name")
     parser.add_argument("--wandb-entity", type=str, default=None,
         help="the entity (team) of wandb's project")
+    parser.add_argument("--model-type", type=str, default="gpt-mini",
+        help="the type of model")
     parser.add_argument("--config", type=str, default=None, help="Path to config file")
     parser.add_argument("--hps", nargs="+", help="Override hyperparameter value")
     args = parser.parse_args()
@@ -45,7 +47,6 @@ def parse_args():
 
 @dataclass
 class TrainerConfig:
-    max_iters = None
     batch_size = 64
     learning_rate = 5e-4
     betas = (0.9, 0.95)
@@ -125,6 +126,11 @@ class SortDataset:
 if __name__ == "__main__":
     args = parse_args()
     config = hyperstate.load(Config, file=args.config, overrides=args.hps)
+    gpt_config = config.gpt
+    if args.model_type:
+        assert args.model_type in MODELS_PRESET, f"model_type {args.model_type} not found in {MODELS_PRESET.keys()}"
+        gpt_config = MODELS_PRESET[args.model_type]
+    config.gpt = gpt_config
     print(config)
     run_name = f"{args.exp_name}__{args.seed}__{int(time.time())}"
     if args.track:
@@ -136,7 +142,6 @@ if __name__ == "__main__":
             sync_tensorboard=True,
             config=vars(args),
             name=run_name,
-            monitor_gym=True,
             save_code=True,
         )
     writer = SummaryWriter(f"runs/{run_name}")
@@ -162,14 +167,15 @@ if __name__ == "__main__":
 
     # initialize model
     gpt = GPT(
-        c=config.gpt,
+        config=config.gpt,
         vocab_size=vocab_size,
         block_size=block_size,
     )
     x = jax.random.randint(key, (1, block_size), minval=0, maxval=vocab_size)  # B, T; or batch_size, sequence_length
     y = jax.random.randint(key, (1, block_size), minval=0, maxval=vocab_size)  # B; or batch_size, sequence_length
-    gpt_params = gpt.init(params_key, x, y, key)
-    gpt_loss, (gpt_y, key) = gpt.apply(gpt_params, x, y, key)
+    gpt_params = gpt.init(params_key, x, y, deterministic=True)
+    print(gpt.tabulate(key, x, y, deterministic=True))
+    gpt_loss, (gpt_y) = gpt.apply(gpt_params, x, y, deterministic=True)
     train_state = TrainState.create(
         apply_fn=gpt.apply,
         params=gpt_params,
@@ -201,9 +207,10 @@ if __name__ == "__main__":
 
     @jax.jit
     def update(train_state: TrainState, x, y, key):
-        (loss, (logits, key)), grads = jax.value_and_grad(train_state.apply_fn, has_aux=True)(train_state.params, x, y, key)
+        dropout_key = jax.random.fold_in(key, train_state.step)
+        (loss, logits), grads = jax.value_and_grad(train_state.apply_fn, has_aux=True)(train_state.params, x, y, deterministic=False, rngs={'dropout': dropout_key})
         train_state = train_state.apply_gradients(grads=grads)
-        return train_state, (loss, logits, key)
+        return train_state, (loss, logits)
 
     def generate(train_state, key, input_tokens, max_new_tokens, temperature=1.0, top_k=None):
         B, T = input_tokens.shape
@@ -222,8 +229,8 @@ if __name__ == "__main__":
             # if the sequence context is growing too long we must crop it at block_size
             # idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _ = train_state.apply_fn(
-                train_state.params, jax.lax.dynamic_slice(tokens, (0, start_i), (B, block_size)), targets=None, key=step_key
+            logits = train_state.apply_fn(
+                train_state.params, jax.lax.dynamic_slice(tokens, (0, start_i), (B, block_size)), targets=None, deterministic=False, rngs={'dropout': step_key}
             )  # TODO: (0, 0) is going to be problematic
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, i - 1, :] / temperature
@@ -256,8 +263,10 @@ if __name__ == "__main__":
         x, y = batch
         # raise
 
-        train_state, (loss, logits, key) = update(train_state, x, y, key)
+        train_state, (loss, logits) = update(train_state, x, y, key)
 
+        writer.add_scalar("train/loss", loss.item(), iter_num)
+        writer.add_scalar("charts/learning_rate", train_state.opt_state[1].hyperparams["learning_rate"].item(), iter_num)
         if iter_num % 100 == 0:
             print(f"iter_dt {iter_dt * 1000:.2f}ms; iter {iter_num}: train loss {loss.item():.5f}")
 
@@ -265,24 +274,20 @@ if __name__ == "__main__":
         tnow = time.time()
         iter_dt = tnow - iter_time
         iter_time = tnow
-        # break
 
         # termination conditions
         if iter_num >= config.trainer.max_iters:
             break
 
-    # n = train_dataset.length # naugy direct access shrug
-    # inp = jnp.array([[0, 0, 2, 1, 0, 1]], dtype=jnp.int32)
-    # cat = generate(train_state, key, inp, n)
-    # sol = jnp.sort(inp)
-    # sol_candidate = cat[:, n:]
-    # print('input sequence  :', inp)
-    # print('predicted sorted:', sol_candidate)
-    # print('gt sort         :', sol)
-    # print('matches         :', bool((sol == sol_candidate).all()))
-
-    # # now let's perform some evaluation
-    # model.eval()
+    n = train_dataset.length # naugy direct access shrug
+    inp = jnp.array([[0, 0, 2, 1, 0, 1]], dtype=jnp.int32)
+    cat = generate(train_state, key, inp, n)
+    sol = jnp.sort(inp)
+    sol_candidate = cat[:, n:]
+    print('input sequence  :', inp)
+    print('predicted sorted:', sol_candidate)
+    print('gt sort         :', sol)
+    print('matches         :', bool((sol == sol_candidate).all()))
 
     def eval_split(split, max_batches, key):
         dataset = {"train": train_dataset, "test": test_dataset}[split]

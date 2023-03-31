@@ -19,7 +19,7 @@ from flax.training.train_state import TrainState
 from torch.utils.data.dataloader import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-from cleanrlhf.model import GPT, GPTConfig, MODELS_PRESET #, param_decay_mask
+from cleanrlhf.model import GPT, GPTConfig, MODELS_PRESET
 
 os.environ[
     "XLA_PYTHON_CLIENT_MEM_FRACTION"
@@ -39,7 +39,6 @@ def parse_args():
         help="the wandb's project name")
     parser.add_argument("--wandb-entity", type=str, default=None,
         help="the entity (team) of wandb's project")
-
     parser.add_argument("--model-type", type=str, default="gpt-mini",
         help="the type of model")
     parser.add_argument("--config", type=str, default=None, help="Path to config file")
