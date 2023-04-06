@@ -6,7 +6,7 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import optax
-
+import tyro
 
 def dropout(x: jnp.ndarray, rate: float, key: jax.random.KeyArray) -> jnp.ndarray:
     """
@@ -117,7 +117,7 @@ class Block(nn.Module):
         return x
 
 
-@dataclass
+@dataclass(frozen=True)
 class GPTConfig:
     n_layer: int = 3
     n_head: int = 3
@@ -175,23 +175,24 @@ class GPT(nn.Module):
         loss = loss.mean(where=targets.reshape(-1) != -1)  # only calculate the mean for indices that are ignored
         return loss, logits
 
-
-MODELS_PRESET: Dict[str, GPTConfig] = {
-    "openai-gpt": GPTConfig(n_layer=12, n_head=12, embd_dim=768),  # 117M params
-    # GPT-2 configs
-    "gpt2": GPTConfig(n_layer=12, n_head=12, embd_dim=768),  # 124M params
-    "gpt2-medium": GPTConfig(n_layer=24, n_head=16, embd_dim=1024),  # 350M params
-    "gpt2-large": GPTConfig(n_layer=36, n_head=20, embd_dim=1280),  # 774M params
-    "gpt2-xl": GPTConfig(n_layer=48, n_head=25, embd_dim=1600),  # 1558M params
-    # Gophers
-    "gopher-44m": GPTConfig(n_layer=8, n_head=16, embd_dim=512),
-    # (there are a number more...)
-    # I made these tiny models up
-    "gpt-small": GPTConfig(n_layer=6, n_head=6, embd_dim=384, use_bias=False),
-    "gpt-mini": GPTConfig(n_layer=6, n_head=6, embd_dim=192),
-    "gpt-micro": GPTConfig(n_layer=4, n_head=4, embd_dim=128),
-    "gpt-nano": GPTConfig(n_layer=3, n_head=3, embd_dim=48),
-}
+GPTConfigPreset = tyro.extras.subcommand_type_from_defaults(
+    {
+        "openai-gpt": GPTConfig(n_layer=12, n_head=12, embd_dim=768),  # 117M params
+        # GPT-2 configs
+        "gpt2": GPTConfig(n_layer=12, n_head=12, embd_dim=768),  # 124M params
+        "gpt2-medium": GPTConfig(n_layer=24, n_head=16, embd_dim=1024),  # 350M params
+        "gpt2-large": GPTConfig(n_layer=36, n_head=20, embd_dim=1280),  # 774M params
+        "gpt2-xl": GPTConfig(n_layer=48, n_head=25, embd_dim=1600),  # 1558M params
+        # Gophers
+        "gopher-44m": GPTConfig(n_layer=8, n_head=16, embd_dim=512),
+        # (there are a number more...)
+        # I made these tiny models up
+        "gpt-small": GPTConfig(n_layer=6, n_head=6, embd_dim=384, use_bias=False),
+        "gpt-mini": GPTConfig(n_layer=6, n_head=6, embd_dim=192),
+        "gpt-micro": GPTConfig(n_layer=4, n_head=4, embd_dim=128),
+        "gpt-nano": GPTConfig(n_layer=3, n_head=3, embd_dim=48),
+    }
+)
 
 
 def param_decay_mask(params: flax.core.FrozenDict) -> flax.core.FrozenDict:
@@ -200,6 +201,51 @@ def param_decay_mask(params: flax.core.FrozenDict) -> flax.core.FrozenDict:
     flat_param_mask = {k: k[-1] not in ("bias", "embedding", "scale") for k in flat_params.keys()}
     param_mask = flax.traverse_util.unflatten_dict(flat_param_mask)
     return flax.core.frozen_dict.freeze(param_mask)
+
+
+def generate(train_state, block_size, key, input_tokens, max_new_tokens, temperature=1.0, top_k=None):
+    B, T = input_tokens.shape
+    padding = jnp.zeros((B, max(block_size - T, max_new_tokens)), dtype=jnp.int32)
+    tokens = jnp.concatenate([input_tokens, padding], axis=-1)
+    indexes = jnp.arange(T, T + max_new_tokens)
+    start_indexes = (indexes - block_size).clip(min=0)
+    # print("B, T, max_new_tokens, tokens", B, T, max_new_tokens, tokens.shape)
+    # tokens index -> tokens None
+    def scan_f(tokens, item):
+        (i, start_i) = item
+        # l: x y
+        # t: a b - -
+        # i: 0 1 2 3
+        step_key = jax.random.fold_in(key, i)
+        # if the sequence context is growing too long we must crop it at block_size
+        # idx_cond = idx if idx.size(1) <= self.block_size else idx[:, -self.block_size:]
+        # forward the model to get the logits for the index in the sequence
+        logits = train_state.apply_fn(
+            train_state.params,
+            jax.lax.dynamic_slice(tokens, (0, start_i), (B, block_size)),
+            targets=None,
+            deterministic=False,
+            rngs={"dropout": step_key},
+        )  # TODO: (0, 0) is going to be problematic
+        # pluck the logits at the final step and scale by desired temperature
+        logits = logits[:, i - 1, :] / temperature
+        # optionally crop the logits to only the top k options
+        # sample from the distribution
+        if top_k is not None:
+            top_logits, top_tokens = jax.lax.top_k(logits, min(top_k, logits.shape[-1]))
+            token_idx = jax.random.categorical(step_key, top_logits, axis=-1)
+            next_token = jnp.take_along_axis(top_tokens, token_idx[:, None], axis=-1).squeeze(-1)
+        else:
+            next_token = jax.random.categorical(step_key, logits, axis=-1)
+            # logits = jnp.where(logits < v[:, -1:], float('-inf'), logits)
+        # append sampled index to the running sequence and continue
+        tokens = tokens.at[:, i].set(next_token)
+
+        return tokens, None
+
+    tokens, _ = jax.lax.scan(scan_f, tokens, (indexes, start_indexes))
+
+    return tokens
 
 
 if __name__ == "__main__":

@@ -3,25 +3,26 @@ import pickle
 import random
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
-import flax
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+from orbax.checkpoint import CheckpointManager, Checkpointer, PyTreeCheckpointHandler, CheckpointManagerOptions
 import tyro
 from flax.training.train_state import TrainState
 from torch.utils.tensorboard import SummaryWriter
 
-from cleanrlhf.model import GPT, MODELS_PRESET, GPTConfig, param_decay_mask
+from cleanrlhf.model import GPT, GPTConfigPreset, GPTConfig, param_decay_mask
+from rich.pretty import pprint
 
 os.environ[
     "XLA_PYTHON_CLIENT_MEM_FRACTION"
 ] = "0.7"  # see https://github.com/google/jax/discussions/6332#discussioncomment-1279991
 
 
-@dataclass
+@dataclass(frozen=True)
 class CosineDecayScheduleConfig:
     init_value: float = 0
     peak_value: float = 0.001
@@ -31,21 +32,8 @@ class CosineDecayScheduleConfig:
 
 
 @dataclass
-class TrainerConfig:
-    batch_size: Optional[int] = None
-    local_batch_size = 64
-    learning_rate: CosineDecayScheduleConfig = field(default_factory=CosineDecayScheduleConfig)
-    betas: Tuple[int] = (0.9, 0.99)
-    weight_decay: float = 0.1  # only applied on matmul weights
-    grad_norm_clip: float = 1.0
-    num_workers: int = 0
-    max_iters: int = 10000
-    block_size: int = 256
-    gradient_accumulation_steps: int = 5 * 8  # used to simulate larger batch sizes; *8 simulates 8 GPUs
-
-
-@dataclass
 class Args:
+    # common args
     exp_name: str = os.path.basename(__file__).rstrip(".py")
     """the name of this experiment"""
     seed: int = 1
@@ -57,21 +45,112 @@ class Args:
     wandb_entity: Optional[str] = None
     """the entity (team) of wandb's project"""
 
+    # logistics args
     data_dir: str = "./data/shakespeare_char"
     """the data_dir to use"""
-    model_type: str = "gpt-small"
-    """the type of model"""
+    ckpt_dir: Optional[str] = None
+    """the checkpoint directory to use"""
 
-    gpt: GPTConfig = field(default_factory=GPTConfig)
-    trainer: TrainerConfig = field(default_factory=TrainerConfig)
+    # training args
+    local_batch_size: int = 64
+    """the local batch size to use"""
+    batch_size: Optional[int] = None
+    """TO BE UPDATED IN RUNTIME: the effective batch size (calculated as local_batch_size * jax.device_count() * gradient_accumulation_steps)"""
+    learning_rate: CosineDecayScheduleConfig = field(default_factory=CosineDecayScheduleConfig)
+    """the learning rate schedule"""
+    betas: Tuple[int] = (0.9, 0.99)
+    """the betas for the Adam optimizer"""
+    weight_decay: float = 0.1  # only applied on matmul weights
+    """the weight decay to use"""
+    grad_norm_clip: float = 1.0
+    """the gradient norm clipping to use"""
+    max_iters: int = 5000
+    """the maximum number of iterations to run"""
+    block_size: int = 256
+    """the block size to use"""
+    vocab_size: Optional[int] = None
+    """TO BE UPDATED IN RUNTIME: the vocab size of the dataset"""
+    gradient_accumulation_steps: int = 5 * 8  # used to simulate larger batch sizes; *8 simulates 8 GPUs
+    """the number of gradient accumulation steps to use"""
+    gpt: GPTConfigPreset = GPTConfig(n_layer=6, n_head=6, embd_dim=384, use_bias=False)
+    """the model's hyperparameters"""
+
+    # distributed args
+    world_size: int = 1
+    """TO BE UPDATED IN RUNTIME: the number of processes to use"""
+    local_rank: int = 0
+    """TO BE UPDATED IN RUNTIME: the local rank of the process"""
+    global_devices: List[int] = None
+    """TO BE UPDATED IN RUNTIME: the global devices to use"""
+    local_devices: List[int] = None
+    """TO BE UPDATED IN RUNTIME: the local devices to use"""
+
+
+
+def init_model(key: jax.random.PRNGKey, args: Args) -> TrainState:
+    gpt = GPT(
+        config=args.gpt,
+        vocab_size=args.vocab_size,
+        block_size=args.block_size,
+    )
+    x = jax.random.randint(
+        key, (args.local_batch_size, args.block_size), minval=0, maxval=args.vocab_size
+    )  # B, T; or local_batch_size, sequence_length
+    y = jax.random.randint(
+        key, (args.local_batch_size, args.block_size), minval=0, maxval=args.vocab_size
+    )  # B; or local_batch_size, sequence_length
+    gpt_params = gpt.init(key, x, y, deterministic=True)
+    print(gpt.tabulate(key, x, y, deterministic=True))
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(args.grad_norm_clip),
+        optax.inject_hyperparams(optax.adamw)(
+            learning_rate=optax.warmup_cosine_decay_schedule(**asdict(args.learning_rate)),
+            b1=args.betas[0],
+            b2=args.betas[1],
+            weight_decay=args.weight_decay,
+            mask=param_decay_mask(gpt_params),
+        ),
+    )
+    # optax.MultiSteps handles schedule properly (https://optax.readthedocs.io/en/latest/gradient_accumulation.html#interaction-of-optax-multistep-with-schedules)
+    # it works properly with `clip_by_global_norm` by only clip the grad norm of the accumulated gradients.
+    optimizer = optax.MultiSteps(optimizer, every_k_schedule=args.gradient_accumulation_steps)
+    return TrainState.create(
+        apply_fn=gpt.apply,
+        params=gpt_params,
+        tx=optimizer,
+    )
 
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
-    if args.model_type:
-        assert args.model_type in MODELS_PRESET, f"model_type {args.model_type} not found in {MODELS_PRESET.keys()}"
-        args.gpt = MODELS_PRESET[args.model_type]
     run_name = f"{args.exp_name}__{args.seed}__{int(time.time())}"
+
+    # load data's vocab_size
+    meta_path = os.path.join(args.data_dir, "meta.pkl")
+    vocab_size = None
+    if os.path.exists(meta_path):
+        with open(meta_path, "rb") as f:
+            meta = pickle.load(f)
+        vocab_size = meta["vocab_size"]
+        print(f"found vocab_size = {vocab_size} (inside {meta_path})")
+    if vocab_size is None:
+        print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
+        vocab_size = 50304
+    train_data = np.memmap(os.path.join(args.data_dir, "train.bin"), dtype=np.uint16, mode="r")
+    val_data = np.memmap(os.path.join(args.data_dir, "val.bin"), dtype=np.uint16, mode="r")
+    
+    # fill in the args
+    args.vocab_size = vocab_size
+    args.batch_size = args.local_batch_size * jax.device_count() * args.gradient_accumulation_steps
+    if args.ckpt_dir is None:
+        args.ckpt_dir = f"runs/{run_name}/models"
+    args.world_size = jax.process_count()
+    args.local_rank = jax.process_index()
+    local_devices = jax.local_devices()
+    global_devices = jax.devices()
+    args.global_devices = [str(item) for item in global_devices]
+    args.local_devices = [str(item) for item in local_devices]
+
     if args.track:
         import wandb
 
@@ -88,65 +167,31 @@ if __name__ == "__main__":
         "hyperparameters",
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
+    pprint(args)
 
     # seeding
     random.seed(args.seed)
     np.random.seed(args.seed)
     key = jax.random.PRNGKey(args.seed)
     key, params_key, actor_key, critic_key = jax.random.split(key, 4)
-    block_size = args.trainer.block_size
 
     # poor man's data loader
-    meta_path = os.path.join(args.data_dir, "meta.pkl")
-    vocab_size = None
-    if os.path.exists(meta_path):
-        with open(meta_path, "rb") as f:
-            meta = pickle.load(f)
-        vocab_size = meta["vocab_size"]
-        print(f"found vocab_size = {vocab_size} (inside {meta_path})")
-    train_data = np.memmap(os.path.join(args.data_dir, "train.bin"), dtype=np.uint16, mode="r")
-    val_data = np.memmap(os.path.join(args.data_dir, "val.bin"), dtype=np.uint16, mode="r")
-
     def get_batch(split):
         data = train_data if split == "train" else val_data
-        ix = np.random.randint(len(data) - block_size, size=(args.trainer.local_batch_size,))
-        x = np.stack([(data[i : i + block_size]).astype(np.int64) for i in ix])
-        y = np.stack([(data[i + 1 : i + 1 + block_size]).astype(np.int64) for i in ix])
+        ix = np.random.randint(len(data) - args.block_size, size=(args.local_batch_size,))
+        x = np.stack([(data[i : i + args.block_size]).astype(np.int64) for i in ix])
+        y = np.stack([(data[i + 1 : i + 1 + args.block_size]).astype(np.int64) for i in ix])
         x, y = jax.device_put((x, y))
         return x, y
 
     # initialize model
-    gpt = GPT(
-        config=args.gpt,
-        vocab_size=vocab_size,
-        block_size=block_size,
-    )
-    x = jax.random.randint(
-        key, (args.trainer.local_batch_size, block_size), minval=0, maxval=vocab_size
-    )  # B, T; or local_batch_size, sequence_length
-    y = jax.random.randint(
-        key, (args.trainer.local_batch_size, block_size), minval=0, maxval=vocab_size
-    )  # B; or local_batch_size, sequence_length
-    gpt_params = gpt.init(params_key, x, y, deterministic=True)
-    print(gpt.tabulate(key, x, y, deterministic=True))
-    gpt_loss, (gpt_y) = gpt.apply(gpt_params, x, y, deterministic=True)
-    optimizer = optax.chain(
-        optax.clip_by_global_norm(args.trainer.grad_norm_clip),
-        optax.inject_hyperparams(optax.adamw)(
-            learning_rate=optax.warmup_cosine_decay_schedule(**asdict(args.trainer.learning_rate)),
-            b1=args.trainer.betas[0],
-            b2=args.trainer.betas[1],
-            weight_decay=args.trainer.weight_decay,
-            mask=param_decay_mask(gpt_params),
-        ),
-    )
-    # optax.MultiSteps handles schedule properly (https://optax.readthedocs.io/en/latest/gradient_accumulation.html#interaction-of-optax-multistep-with-schedules)
-    # it works properly with `clip_by_global_norm` by only clip the grad norm of the accumulated gradients.
-    optimizer = optax.MultiSteps(optimizer, every_k_schedule=args.trainer.gradient_accumulation_steps)
-    train_state = TrainState.create(
-        apply_fn=gpt.apply,
-        params=gpt_params,
-        tx=optimizer,
+    train_state = init_model(key, args)
+    os.makedirs(args.ckpt_dir, exist_ok=True)
+    mngr = CheckpointManager(
+        args.ckpt_dir,
+        checkpointers={'train_state': Checkpointer(PyTreeCheckpointHandler())},
+        options=CheckpointManagerOptions(max_to_keep=1, save_interval_steps=500),
+        metadata={'args': tyro.to_yaml(args)},
     )
 
     # setup the training loop
@@ -164,88 +209,24 @@ if __name__ == "__main__":
         train_state = train_state.apply_gradients(grads=grads)
         return train_state, (loss, logits)
 
-    def generate(train_state, key, input_tokens, max_new_tokens, temperature=1.0, top_k=None):
-        B, T = input_tokens.shape
-        padding = jnp.zeros((B, max(block_size - T, max_new_tokens)), dtype=jnp.int32)
-        tokens = jnp.concatenate([input_tokens, padding], axis=-1)
-        indexes = jnp.arange(T, T + max_new_tokens)
-        start_indexes = (indexes - block_size).clip(min=0)
-        # print("B, T, max_new_tokens, tokens", B, T, max_new_tokens, tokens.shape)
-        # tokens index -> tokens None
-        def scan_f(tokens, item):
-            (i, start_i) = item
-            # l: x y
-            # t: a b - -
-            # i: 0 1 2 3
-            step_key = jax.random.fold_in(key, i)
-            # if the sequence context is growing too long we must crop it at block_size
-            # idx_cond = idx if idx.size(1) <= self.args.block_size else idx[:, -self.args.block_size:]
-            # forward the model to get the logits for the index in the sequence
-            logits = train_state.apply_fn(
-                train_state.params,
-                jax.lax.dynamic_slice(tokens, (0, start_i), (B, block_size)),
-                targets=None,
-                deterministic=False,
-                rngs={"dropout": step_key},
-            )  # TODO: (0, 0) is going to be problematic
-            # pluck the logits at the final step and scale by desired temperature
-            logits = logits[:, i - 1, :] / temperature
-            # optionally crop the logits to only the top k options
-            # sample from the distribution
-            if top_k is not None:
-                top_logits, top_tokens = jax.lax.top_k(logits, min(top_k, logits.shape[-1]))
-                token_idx = jax.random.categorical(step_key, top_logits, axis=-1)
-                next_token = jnp.take_along_axis(top_tokens, token_idx[:, None], axis=-1).squeeze(-1)
-            else:
-                next_token = jax.random.categorical(step_key, logits, axis=-1)
-                # logits = jnp.where(logits < v[:, -1:], float('-inf'), logits)
-            # append sampled index to the running sequence and continue
-            tokens = tokens.at[:, i].set(next_token)
-
-            return tokens, None
-
-        tokens, _ = jax.lax.scan(scan_f, tokens, (indexes, start_indexes))
-
-        return tokens
-
     while True:
-        for micro_step in range(args.trainer.gradient_accumulation_steps):
+        for micro_step in range(args.gradient_accumulation_steps):
             train_state, (loss, logits) = update(train_state, X, Y, key)
-            print(f"iter {iter_num}, micro_step {micro_step}: loss {loss.item()}")
+            # print(f"iter {iter_num}, micro_step {micro_step}: loss {loss.item()}")
             X, Y = get_batch("train")
-        # immediately async prefetch next batch while model is doing the forward pass on the GPU
+            # immediately async prefetch next batch while model is doing the forward pass on the GPU
+
         writer.add_scalar("train/loss", loss.item(), iter_num)
         writer.add_scalar("charts/learning_rate", train_state.opt_state[2][1].hyperparams["learning_rate"].item(), iter_num)
         if iter_num % 10 == 0:
             print(f"iter_dt {iter_dt * 1000:.2f}ms; iter {iter_num}: train loss {loss.item():.5f}")
 
-        if iter_num % 500 == 0:
-            model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
-            with open(model_path, "wb") as f:
-                f.write(
-                    flax.serialization.to_bytes(
-                        {
-                            "args": asdict(args),
-                            "params": train_state.params,
-                        }
-                    )
-                )
-            print(f"model saved to {model_path}")
-
-        #     eval_len = 500
-        #     # sample from the model...
-        #     context = "O God, O God!"
-        #     key, subkey = jax.random.split(key, 2)
-        #     x = np.array([train_dataset.stoi[s] for s in context], dtype=np.int32)[None, ...]
-        #     y = generate(train_state, subkey, x, eval_len, temperature=0.9, top_k=5)[0][: len(x[0]) + eval_len]
-        #     completion = "".join([train_dataset.itos[int(i)] for i in y])
-        #     print(len(completion), completion)
-
+        mngr.save(iter_num, {'train_state': train_state})
         iter_num += 1
         tnow = time.time()
         iter_dt = tnow - iter_time
         iter_time = tnow
 
         # termination conditions
-        if iter_num >= args.trainer.max_iters:
+        if iter_num >= args.max_iters:
             break
