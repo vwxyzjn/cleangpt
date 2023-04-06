@@ -1,23 +1,17 @@
-import argparse
 import os
 import pickle
 import random
 import time
-from typing import Optional, Tuple
-import urllib.request
 from dataclasses import asdict, dataclass, field
-from distutils.util import strtobool
-import flax
+from typing import Optional, Tuple
 
-import tyro
+import flax
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-import torch
+import tyro
 from flax.training.train_state import TrainState
-from torch.utils.data import Dataset
-from torch.utils.data.dataloader import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from cleanrlhf.model import GPT, MODELS_PRESET, GPTConfig, param_decay_mask
@@ -35,6 +29,7 @@ class CosineDecayScheduleConfig:
     decay_steps: int = 5000
     end_value: float = 0.0001
 
+
 @dataclass
 class TrainerConfig:
     batch_size: Optional[int] = None
@@ -47,6 +42,7 @@ class TrainerConfig:
     max_iters: int = 10000
     block_size: int = 256
     gradient_accumulation_steps: int = 5 * 8  # used to simulate larger batch sizes; *8 simulates 8 GPUs
+
 
 @dataclass
 class Args:
@@ -99,32 +95,38 @@ if __name__ == "__main__":
     key = jax.random.PRNGKey(args.seed)
     key, params_key, actor_key, critic_key = jax.random.split(key, 4)
     block_size = args.trainer.block_size
-    
+
     # poor man's data loader
-    meta_path = os.path.join(args.data_dir, 'meta.pkl')
+    meta_path = os.path.join(args.data_dir, "meta.pkl")
     vocab_size = None
     if os.path.exists(meta_path):
-        with open(meta_path, 'rb') as f:
+        with open(meta_path, "rb") as f:
             meta = pickle.load(f)
-        vocab_size = meta['vocab_size']
+        vocab_size = meta["vocab_size"]
         print(f"found vocab_size = {vocab_size} (inside {meta_path})")
-    train_data = np.memmap(os.path.join(args.data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-    val_data = np.memmap(os.path.join(args.data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+    train_data = np.memmap(os.path.join(args.data_dir, "train.bin"), dtype=np.uint16, mode="r")
+    val_data = np.memmap(os.path.join(args.data_dir, "val.bin"), dtype=np.uint16, mode="r")
+
     def get_batch(split):
-        data = train_data if split == 'train' else val_data
+        data = train_data if split == "train" else val_data
         ix = np.random.randint(len(data) - block_size, size=(args.trainer.local_batch_size,))
-        x = np.stack([(data[i:i+block_size]).astype(np.int64) for i in ix])
-        y = np.stack([(data[i+1:i+1+block_size]).astype(np.int64) for i in ix])
+        x = np.stack([(data[i : i + block_size]).astype(np.int64) for i in ix])
+        y = np.stack([(data[i + 1 : i + 1 + block_size]).astype(np.int64) for i in ix])
         x, y = jax.device_put((x, y))
         return x, y
+
     # initialize model
     gpt = GPT(
         config=args.gpt,
         vocab_size=vocab_size,
         block_size=block_size,
     )
-    x = jax.random.randint(key, (args.trainer.local_batch_size, block_size), minval=0, maxval=vocab_size)  # B, T; or local_batch_size, sequence_length
-    y = jax.random.randint(key, (args.trainer.local_batch_size, block_size), minval=0, maxval=vocab_size)  # B; or local_batch_size, sequence_length
+    x = jax.random.randint(
+        key, (args.trainer.local_batch_size, block_size), minval=0, maxval=vocab_size
+    )  # B, T; or local_batch_size, sequence_length
+    y = jax.random.randint(
+        key, (args.trainer.local_batch_size, block_size), minval=0, maxval=vocab_size
+    )  # B; or local_batch_size, sequence_length
     gpt_params = gpt.init(params_key, x, y, deterministic=True)
     print(gpt.tabulate(key, x, y, deterministic=True))
     gpt_loss, (gpt_y) = gpt.apply(gpt_params, x, y, deterministic=True)
@@ -151,7 +153,7 @@ if __name__ == "__main__":
     iter_num = 0
     iter_time = 0.0
     iter_dt = 0.0
-    X, Y = get_batch('train') # fetch the very first batch
+    X, Y = get_batch("train")  # fetch the very first batch
 
     @jax.jit
     def update(train_state: TrainState, x, y, key):
@@ -210,7 +212,7 @@ if __name__ == "__main__":
         for micro_step in range(args.trainer.gradient_accumulation_steps):
             train_state, (loss, logits) = update(train_state, X, Y, key)
             print(f"iter {iter_num}, micro_step {micro_step}: loss {loss.item()}")
-            X, Y = get_batch('train')
+            X, Y = get_batch("train")
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         writer.add_scalar("train/loss", loss.item(), iter_num)
         writer.add_scalar("charts/learning_rate", train_state.opt_state[2][1].hyperparams["learning_rate"].item(), iter_num)

@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import Dict, Optional
-import flax
 
+import flax
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
@@ -195,9 +195,9 @@ MODELS_PRESET: Dict[str, GPTConfig] = {
 
 
 def param_decay_mask(params: flax.core.FrozenDict) -> flax.core.FrozenDict:
-    """ pytree mask for non-bias parameters """
+    """pytree mask for non-bias parameters"""
     flat_params = flax.traverse_util.flatten_dict(params)
-    flat_param_mask = {k: k[-1] not in ('bias', 'embedding', 'scale') for k in flat_params.keys()}
+    flat_param_mask = {k: k[-1] not in ("bias", "embedding", "scale") for k in flat_params.keys()}
     param_mask = flax.traverse_util.unflatten_dict(flat_param_mask)
     return flax.core.frozen_dict.freeze(param_mask)
 
