@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Optional
 
 import flax
 import flax.linen as nn
@@ -7,6 +7,7 @@ import jax
 import jax.numpy as jnp
 import optax
 import tyro
+
 
 def dropout(x: jnp.ndarray, rate: float, key: jax.random.KeyArray) -> jnp.ndarray:
     """
@@ -174,6 +175,7 @@ class GPT(nn.Module):
         )
         loss = loss.mean(where=targets.reshape(-1) != -1)  # only calculate the mean for indices that are ignored
         return loss, logits
+
 
 GPTConfigPreset = tyro.extras.subcommand_type_from_defaults(
     {

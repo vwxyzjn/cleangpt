@@ -6,16 +6,20 @@ from dataclasses import asdict, dataclass, field
 from typing import List, Optional, Tuple
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 import optax
-from orbax.checkpoint import CheckpointManager, Checkpointer, PyTreeCheckpointHandler, CheckpointManagerOptions
 import tyro
 from flax.training.train_state import TrainState
+from orbax.checkpoint import (
+    Checkpointer,
+    CheckpointManager,
+    CheckpointManagerOptions,
+    PyTreeCheckpointHandler,
+)
+from rich.pretty import pprint
 from torch.utils.tensorboard import SummaryWriter
 
-from cleanrlhf.model import GPT, GPTConfigPreset, GPTConfig, param_decay_mask
-from rich.pretty import pprint
+from cleanrlhf.model import GPT, GPTConfig, GPTConfigPreset, param_decay_mask
 
 os.environ[
     "XLA_PYTHON_CLIENT_MEM_FRACTION"
@@ -86,7 +90,6 @@ class Args:
     """TO BE UPDATED IN RUNTIME: the local devices to use"""
 
 
-
 def init_model(key: jax.random.PRNGKey, args: Args) -> TrainState:
     gpt = GPT(
         config=args.gpt,
@@ -138,7 +141,7 @@ if __name__ == "__main__":
         vocab_size = 50304
     train_data = np.memmap(os.path.join(args.data_dir, "train.bin"), dtype=np.uint16, mode="r")
     val_data = np.memmap(os.path.join(args.data_dir, "val.bin"), dtype=np.uint16, mode="r")
-    
+
     # fill in the args
     args.vocab_size = vocab_size
     args.batch_size = args.local_batch_size * jax.device_count() * args.gradient_accumulation_steps
@@ -189,9 +192,9 @@ if __name__ == "__main__":
     os.makedirs(args.ckpt_dir, exist_ok=True)
     mngr = CheckpointManager(
         args.ckpt_dir,
-        checkpointers={'train_state': Checkpointer(PyTreeCheckpointHandler())},
+        checkpointers={"train_state": Checkpointer(PyTreeCheckpointHandler())},
         options=CheckpointManagerOptions(max_to_keep=1, save_interval_steps=500),
-        metadata={'args': tyro.to_yaml(args)},
+        metadata={"args": tyro.to_yaml(args)},
     )
 
     # setup the training loop
@@ -221,7 +224,7 @@ if __name__ == "__main__":
         if iter_num % 10 == 0:
             print(f"iter_dt {iter_dt * 1000:.2f}ms; iter {iter_num}: train loss {loss.item():.5f}")
 
-        mngr.save(iter_num, {'train_state': train_state})
+        mngr.save(iter_num, {"train_state": train_state})
         iter_num += 1
         tnow = time.time()
         iter_dt = tnow - iter_time
