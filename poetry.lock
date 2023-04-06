@@ -1331,18 +1331,6 @@ files = [
 dill = ">=0.3.6"
 
 [[package]]
-name = "nest-asyncio"
-version = "1.5.6"
-description = "Patch asyncio to allow nested event loops"
-category = "main"
-optional = false
-python-versions = ">=3.5"
-files = [
-    {file = "nest_asyncio-1.5.6-py3-none-any.whl", hash = "sha256:b9a953fb40dceaa587d109609098db21900182b16440652454a146cffb06e8b8"},
-    {file = "nest_asyncio-1.5.6.tar.gz", hash = "sha256:d267cc1ff794403f7df692964d1d2a3fa9418ffea2a3f6859a439ff482fef290"},
-]
-
-[[package]]
 name = "nodeenv"
 version = "1.7.0"
 description = "Node.js virtual environment builder"
@@ -1518,61 +1506,57 @@ typing-extensions = ">=3.10.0"
 
 [[package]]
 name = "orbax"
-version = "0.1.7"
+version = "0.1.3"
 description = "Orbax"
 category = "main"
 optional = false
 python-versions = ">=3.8"
 files = [
-    {file = "orbax-0.1.7-py3-none-any.whl", hash = "sha256:67c7ce52b5476202af84977e8db03dede6c009b5d1f1095acfc175578038449b"},
-    {file = "orbax-0.1.7.tar.gz", hash = "sha256:2517f566134db6597d2850450b7f486efd24bf24962bc4881007f4cc8e978b37"},
+    {file = "orbax-0.1.3-py3-none-any.whl", hash = "sha256:a5268b372f28dd085ef1c400f0eb7514fd235c719989b5caa145f1ae5773811f"},
+    {file = "orbax-0.1.3.tar.gz", hash = "sha256:e65171df1734da28478d8a2f2da837416e7c7a026a6280dc93264324ea40df5a"},
 ]
 
 [package.dependencies]
 absl-py = "*"
 cached_property = "*"
 etils = "*"
+flax = "*"
 importlib_resources = "*"
-jax = ">=0.4.6"
+jax = ">=0.4.1"
 jaxlib = "*"
-msgpack = "*"
-nest_asyncio = "*"
 numpy = "*"
 pyyaml = "*"
 tensorstore = ">=0.1.20"
-typing_extensions = "*"
 
 [package.extras]
-dev = ["flax", "pytest", "pytest-xdist"]
+dev = ["pytest", "pytest-xdist"]
 
 [[package]]
 name = "orbax-checkpoint"
-version = "0.1.8"
+version = "0.1.1"
 description = "Orbax Checkpoint"
 category = "main"
 optional = false
 python-versions = ">=3.8"
 files = [
-    {file = "orbax-checkpoint-0.1.8.tar.gz", hash = "sha256:4fc4803a6cfcc87f996f7b7c2b1956030782a16720db3bff7db99f12cb590364"},
-    {file = "orbax_checkpoint-0.1.8-py3-none-any.whl", hash = "sha256:fb5b7feb50c95e079edb551907160bfb8401182a6b46d811777d7c3acab1fc42"},
+    {file = "orbax-checkpoint-0.1.1.tar.gz", hash = "sha256:97189f063fe31bbc1c7f9e6b127145631b4b8fe4ecfbe1eeda90e4d128e0503e"},
+    {file = "orbax_checkpoint-0.1.1-py3-none-any.whl", hash = "sha256:eea74d45e3f07abfcf461339bdf400d9059a850fd72a1affdf797b686c8eca90"},
 ]
 
 [package.dependencies]
 absl-py = "*"
 cached_property = "*"
 etils = "*"
+flax = "*"
 importlib_resources = "*"
-jax = ">=0.4.8"
+jax = "*"
 jaxlib = "*"
-msgpack = "*"
-nest_asyncio = "*"
 numpy = "*"
 pyyaml = "*"
-tensorstore = ">=0.1.35"
-typing_extensions = "*"
+tensorstore = ">=0.1.20"
 
 [package.extras]
-dev = ["flax", "pytest", "pytest-xdist"]
+dev = ["pytest", "pytest-xdist"]
 
 [[package]]
 name = "packaging"
@@ -3055,4 +3039,4 @@ testing = ["flake8 (<5)", "func-timeout", "jaraco.functools", "jaraco.itertools"
 [metadata]
 lock-version = "2.0"
 python-versions = ">=3.9,<3.11.0"
-content-hash = "75f4a299533778d34888162be6e26709987982cfcc0454e40d397a2a0c7a4044"
+content-hash = "02990081e147be7e99a33a7e370d7fe7e8aa39128cb956dd702a8011a8b03a6e"

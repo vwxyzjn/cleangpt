@@ -16,7 +16,7 @@ from cleanrlhf.model import generate
 from train_char import Args, init_model
 
 mngr = CheckpointManager(
-    f"runs/train_char__1__1680795852/train_char/models",
+    f"runs/train_char__1__1680814128/models",
     checkpointers={"train_state": Checkpointer(PyTreeCheckpointHandler())},
     options=CheckpointManagerOptions(max_to_keep=1, save_interval_steps=500),
 )

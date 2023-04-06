@@ -1,3 +1,4 @@
+from functools import partial
 import os
 import pickle
 import random
@@ -10,6 +11,7 @@ import numpy as np
 import optax
 import tyro
 from flax.training.train_state import TrainState
+from flax.jax_utils import replicate, unreplicate
 from orbax.checkpoint import (
     Checkpointer,
     CheckpointManager,
@@ -80,13 +82,15 @@ class Args:
     """the model's hyperparameters"""
 
     # distributed args
+    distributed: bool = False
+    """if toggled, this experiment will be distributed"""
     world_size: int = 1
     """TO BE UPDATED IN RUNTIME: the number of processes to use"""
     local_rank: int = 0
     """TO BE UPDATED IN RUNTIME: the local rank of the process"""
-    global_devices: List[int] = None
+    global_devices: Optional[List[int]] = None
     """TO BE UPDATED IN RUNTIME: the global devices to use"""
-    local_devices: List[int] = None
+    local_devices: Optional[List[int]] = None
     """TO BE UPDATED IN RUNTIME: the local devices to use"""
 
 
@@ -142,15 +146,19 @@ if __name__ == "__main__":
     train_data = np.memmap(os.path.join(args.data_dir, "train.bin"), dtype=np.uint16, mode="r")
     val_data = np.memmap(os.path.join(args.data_dir, "val.bin"), dtype=np.uint16, mode="r")
 
+    # jax distributed
+    if args.distributed:
+        jax.distributed.initialize()
+    local_devices = jax.local_devices()
+    global_devices = jax.devices()
+
     # fill in the args
     args.vocab_size = vocab_size
-    args.batch_size = args.local_batch_size * jax.device_count() * args.gradient_accumulation_steps
+    args.batch_size = args.local_batch_size * jax.local_device_count() * args.gradient_accumulation_steps * args.world_size
     if args.ckpt_dir is None:
         args.ckpt_dir = f"runs/{run_name}/models"
     args.world_size = jax.process_count()
     args.local_rank = jax.process_index()
-    local_devices = jax.local_devices()
-    global_devices = jax.devices()
     args.global_devices = [str(item) for item in global_devices]
     args.local_devices = [str(item) for item in local_devices]
 
@@ -176,24 +184,32 @@ if __name__ == "__main__":
     random.seed(args.seed)
     np.random.seed(args.seed)
     key = jax.random.PRNGKey(args.seed)
-    key, params_key, actor_key, critic_key = jax.random.split(key, 4)
+    key, params_key, dropout_key = jax.random.split(key, 3)
+    dropout_key = jax.random.fold_in(dropout_key, jax.process_index())
+    dropout_keys = jax.random.split(dropout_key, jax.local_device_count())
 
     # poor man's data loader
     def get_batch(split):
         data = train_data if split == "train" else val_data
         ix = np.random.randint(len(data) - args.block_size, size=(args.local_batch_size,))
-        x = np.stack([(data[i : i + args.block_size]).astype(np.int64) for i in ix])
-        y = np.stack([(data[i + 1 : i + 1 + args.block_size]).astype(np.int64) for i in ix])
-        x, y = jax.device_put((x, y))
-        return x, y
+        xs, ys = [], []
+        for _ in range(jax.local_device_count()):
+            x = np.stack([(data[i : i + args.block_size]).astype(np.int64) for i in ix])
+            y = np.stack([(data[i + 1 : i + 1 + args.block_size]).astype(np.int64) for i in ix])
+            xs.append(x)
+            ys.append(y)
+        xs = jax.device_put_sharded(xs, local_devices)
+        ys = jax.device_put_sharded(ys, local_devices)
+        return xs, ys
 
     # initialize model
-    train_state = init_model(key, args)
+    train_state = init_model(params_key, args)
+    train_state = replicate(train_state)
     os.makedirs(args.ckpt_dir, exist_ok=True)
     mngr = CheckpointManager(
         args.ckpt_dir,
         checkpointers={"train_state": Checkpointer(PyTreeCheckpointHandler())},
-        options=CheckpointManagerOptions(max_to_keep=1, save_interval_steps=500),
+        options=CheckpointManagerOptions(max_to_keep=1, save_interval_steps=20),
         metadata={"args": tyro.to_yaml(args)},
     )
 
@@ -203,28 +219,30 @@ if __name__ == "__main__":
     iter_dt = 0.0
     X, Y = get_batch("train")  # fetch the very first batch
 
-    @jax.jit
-    def update(train_state: TrainState, x, y, key):
-        dropout_key = jax.random.fold_in(key, train_state.step)
+    @partial(jax.pmap, axis_name='batch', devices=global_devices)
+    def update(train_state: TrainState, x, y, dropout_keys):
+        dropout_keys = jax.random.fold_in(dropout_keys, train_state.step)
         (loss, logits), grads = jax.value_and_grad(train_state.apply_fn, has_aux=True)(
-            train_state.params, x, y, deterministic=False, rngs={"dropout": dropout_key}
+            train_state.params, x, y, deterministic=False, rngs={"dropout": dropout_keys}
         )
+        grads = jax.lax.pmean(grads, axis_name="batch")
+        loss = jax.lax.pmean(loss, axis_name="batch")
         train_state = train_state.apply_gradients(grads=grads)
         return train_state, (loss, logits)
 
     while True:
         for micro_step in range(args.gradient_accumulation_steps):
-            train_state, (loss, logits) = update(train_state, X, Y, key)
+            train_state, (loss, logits) = update(train_state, X, Y, dropout_keys)
             # print(f"iter {iter_num}, micro_step {micro_step}: loss {loss.item()}")
             X, Y = get_batch("train")
             # immediately async prefetch next batch while model is doing the forward pass on the GPU
 
-        writer.add_scalar("train/loss", loss.item(), iter_num)
-        writer.add_scalar("charts/learning_rate", train_state.opt_state[2][1].hyperparams["learning_rate"].item(), iter_num)
+        writer.add_scalar("train/loss", loss[-1].item(), iter_num)
+        writer.add_scalar("charts/learning_rate", train_state.opt_state[2][1].hyperparams["learning_rate"][-1].item(), iter_num)
         if iter_num % 10 == 0:
-            print(f"iter_dt {iter_dt * 1000:.2f}ms; iter {iter_num}: train loss {loss.item():.5f}")
+            print(f"iter_dt {iter_dt * 1000:.2f}ms; iter {iter_num}: train loss {loss[-1].item():.5f}")
 
-        mngr.save(iter_num, {"train_state": train_state})
+        mngr.save(iter_num, {"train_state": unreplicate(train_state)})
         iter_num += 1
         tnow = time.time()
         iter_dt = tnow - iter_time
