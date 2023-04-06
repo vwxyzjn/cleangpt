@@ -117,7 +117,7 @@ class Block(nn.Module):
         return x
 
 
-@dataclass(frozen=True)
+@dataclass
 class GPTConfig:
     n_layer: int = 3
     n_head: int = 3
