@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from typing import Dict, Optional
+import flax
 
 import flax.linen as nn
 import jax
@@ -186,18 +187,19 @@ MODELS_PRESET: Dict[str, GPTConfig] = {
     "gopher-44m": GPTConfig(n_layer=8, n_head=16, embd_dim=512),
     # (there are a number more...)
     # I made these tiny models up
+    "gpt-small": GPTConfig(n_layer=6, n_head=6, embd_dim=384, use_bias=False),
     "gpt-mini": GPTConfig(n_layer=6, n_head=6, embd_dim=192),
     "gpt-micro": GPTConfig(n_layer=4, n_head=4, embd_dim=128),
     "gpt-nano": GPTConfig(n_layer=3, n_head=3, embd_dim=48),
 }
 
 
-# def param_decay_mask(params: flax.core.FrozenDict) -> flax.core.FrozenDict:
-#     """ pytree mask for non-bias parameters """
-#     flat_params = flax.traverse_util.flatten_dict(params)
-#     flat_param_mask = {k: k[-1] not in ('bias', 'embedding', 'scale') for k in flat_params.keys()}
-#     param_mask = flax.traverse_util.unflatten_dict(flat_param_mask)
-#     return flax.core.frozen_dict.freeze(param_mask)
+def param_decay_mask(params: flax.core.FrozenDict) -> flax.core.FrozenDict:
+    """ pytree mask for non-bias parameters """
+    flat_params = flax.traverse_util.flatten_dict(params)
+    flat_param_mask = {k: k[-1] not in ('bias', 'embedding', 'scale') for k in flat_params.keys()}
+    param_mask = flax.traverse_util.unflatten_dict(flat_param_mask)
+    return flax.core.frozen_dict.freeze(param_mask)
 
 
 if __name__ == "__main__":
