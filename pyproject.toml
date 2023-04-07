@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "cleanrlhf"
-version = "0.2.2"
+version = "0.2.1"
 description = ""
 authors = ["Costa Huang <costa.huang@outlook.com>"]
 readme = "README.md"
