@@ -61,7 +61,7 @@ class CausalSelfAttention(nn.Module):
         bias = jnp.tril(jnp.ones((self.block_size, self.block_size))).reshape(1, 1, self.block_size, self.block_size)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        c_attn = nn.Dense(3 * C, use_bias=self.use_bias)(x)  # (B, T, 3 * C), `c_attn` means `concatenated attention`
+        c_attn = nn.Dense(3 * C, use_bias=self.use_bias, dtype=self.dtype)(x)  # (B, T, 3 * C), `c_attn` means `concatenated attention`
         q, k, v = jnp.split(c_attn, 3, axis=-1)  # each has shape (B, T, C)
         q = q.reshape(B, T, self.n_head, head_dim).swapaxes(1, 2)  # (B, nh, T, hd), nh: n_head, hd: head dimensionality
         k = k.reshape(B, T, self.n_head, head_dim).swapaxes(1, 2)  # (B, nh, T, hd)
@@ -73,7 +73,7 @@ class CausalSelfAttention(nn.Module):
         y = attn @ v  # (B, nh, T, hd)
         y = y.swapaxes(1, 2)  # (B, T, nh, hd)
         y = y.reshape(B, T, C)  # (B, T, C)
-        c_proj = nn.Dense(C, use_bias=self.use_bias)(y)  # (B, T, C)
+        c_proj = nn.Dense(C, use_bias=self.use_bias, dtype=self.dtype)(y)  # (B, T, C)
         x = nn.Dropout(rate=self.resid_pdrop)(c_proj, deterministic=deterministic)
         return x
 
@@ -84,13 +84,14 @@ class MLP(nn.Module):
     resid_pdrop: int
     block_size: int  # alias: T, sequence_length
     use_bias: bool
+    dtype: Optional[str] = None
 
     @nn.compact
     def __call__(self, x, deterministic=None):
         B, T, C = x.shape
-        x = nn.Dense(4 * C, use_bias=self.use_bias, name="c_fc")(x)
+        x = nn.Dense(4 * C, use_bias=self.use_bias, dtype=self.dtype, name="c_fc")(x)
         x = nn.gelu(x, approximate=True)
-        x = nn.Dense(C, use_bias=self.use_bias, name="c_proj")(x)
+        x = nn.Dense(C, use_bias=self.use_bias, dtype=self.dtype, name="c_proj")(x)
         x = nn.Dropout(self.resid_pdrop)(x, deterministic)
         return x
 
@@ -105,12 +106,12 @@ class Block(nn.Module):
     dtype: Optional[str] = None
 
     def setup(self):
-        self.ln_1 = nn.LayerNorm(epsilon=1e-5, dtype=self.dtype, use_bias=self.use_bias)
+        self.ln_1 = nn.LayerNorm(epsilon=1e-5, use_bias=self.use_bias, dtype=self.dtype)
         self.attn = CausalSelfAttention(
             self.embd_dim, self.n_head, self.attn_pdrop, self.resid_pdrop, self.block_size, self.use_bias, dtype=self.dtype
         )
-        self.ln_2 = nn.LayerNorm(epsilon=1e-5, dtype=self.dtype, use_bias=self.use_bias)
-        self.mlp = MLP(self.n_head, self.attn_pdrop, self.resid_pdrop, self.block_size, self.use_bias)
+        self.ln_2 = nn.LayerNorm(epsilon=1e-5, use_bias=self.use_bias, dtype=self.dtype)
+        self.mlp = MLP(self.n_head, self.attn_pdrop, self.resid_pdrop, self.block_size, self.use_bias, self.dtype)
 
     def __call__(self, x, deterministic=None):
         x = x + self.attn(self.ln_1(x), deterministic)
@@ -174,7 +175,7 @@ class GPT(nn.Module):
             logits.reshape(-1, jnp.shape(logits)[-1]), valid_targets.reshape(-1)
         )
         loss = loss.mean(where=targets.reshape(-1) != -1)  # only calculate the mean for indices that are ignored
-        return loss, logits
+        return loss
 
 
 GPTConfigPreset = tyro.extras.subcommand_type_from_defaults(
@@ -189,7 +190,7 @@ GPTConfigPreset = tyro.extras.subcommand_type_from_defaults(
         "gopher-44m": GPTConfig(n_layer=8, n_head=16, embd_dim=512),
         # (there are a number more...)
         # I made these tiny models up
-        "gpt-small": GPTConfig(n_layer=6, n_head=6, embd_dim=384, use_bias=False),
+        "gpt-small": GPTConfig(n_layer=6, n_head=6, embd_dim=384, use_bias=False, dtype="bfloat16"),
         "gpt-mini": GPTConfig(n_layer=6, n_head=6, embd_dim=192),
         "gpt-micro": GPTConfig(n_layer=4, n_head=4, embd_dim=128),
         "gpt-nano": GPTConfig(n_layer=3, n_head=3, embd_dim=48),

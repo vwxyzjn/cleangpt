@@ -2,6 +2,7 @@ from functools import partial
 import os
 import pickle
 import random
+import subprocess
 import time
 from dataclasses import asdict, dataclass, field
 from typing import List, Optional, Tuple
@@ -78,8 +79,10 @@ class Args:
     """TO BE UPDATED IN RUNTIME: the vocab size of the dataset"""
     gradient_accumulation_steps: int = 5 * 8  # used to simulate larger batch sizes; *8 simulates 8 GPUs
     """the number of gradient accumulation steps to use"""
-    gpt: GPTConfigPreset = GPTConfig(n_layer=6, n_head=6, embd_dim=384, use_bias=False)
+    gpt: GPTConfigPreset = GPTConfig(n_layer=6, n_head=6, embd_dim=384, use_bias=False, dtype="bfloat16")
     """the model's hyperparameters"""
+    input_dtype: Optional[str] = "uint16"
+    """TO BE UPDATED IN RUNTIME: the input dtype to use"""
 
     # distributed args
     distributed: bool = False
@@ -101,10 +104,10 @@ def init_model(key: jax.random.PRNGKey, args: Args) -> TrainState:
         block_size=args.block_size,
     )
     x = jax.random.randint(
-        key, (args.local_batch_size, args.block_size), minval=0, maxval=args.vocab_size
+        key, (args.local_batch_size, args.block_size), minval=0, maxval=args.vocab_size, dtype=args.input_dtype
     )  # B, T; or local_batch_size, sequence_length
     y = jax.random.randint(
-        key, (args.local_batch_size, args.block_size), minval=0, maxval=args.vocab_size
+        key, (args.local_batch_size, args.block_size), minval=0, maxval=args.vocab_size, dtype=args.input_dtype
     )  # B; or local_batch_size, sequence_length
     gpt_params = gpt.init(key, x, y, deterministic=True)
     print(gpt.tabulate(key, x, y, deterministic=True))
@@ -163,6 +166,8 @@ if __name__ == "__main__":
     args.local_devices = [str(item) for item in local_devices]
 
     if args.track:
+        git_tag = subprocess.check_output(["git", "describe", "--tags"]).decode("ascii").strip()
+        os.environ["WANDB_TAGS"] = git_tag
         import wandb
 
         wandb.init(
@@ -222,20 +227,19 @@ if __name__ == "__main__":
     @partial(jax.pmap, axis_name='batch', devices=global_devices)
     def update(train_state: TrainState, x, y, dropout_keys):
         dropout_keys = jax.random.fold_in(dropout_keys, train_state.step)
-        (loss, logits), grads = jax.value_and_grad(train_state.apply_fn, has_aux=True)(
+        (loss), grads = jax.value_and_grad(train_state.apply_fn, has_aux=False)(
             train_state.params, x, y, deterministic=False, rngs={"dropout": dropout_keys}
         )
         grads = jax.lax.pmean(grads, axis_name="batch")
         loss = jax.lax.pmean(loss, axis_name="batch")
         train_state = train_state.apply_gradients(grads=grads)
-        return train_state, (loss, logits)
+        return train_state, (loss)
 
     while True:
         for micro_step in range(args.gradient_accumulation_steps):
-            train_state, (loss, logits) = update(train_state, X, Y, dropout_keys)
-            # print(f"iter {iter_num}, micro_step {micro_step}: loss {loss.item()}")
-            X, Y = get_batch("train")
+            train_state, (loss) = update(train_state, X, Y, dropout_keys)
             # immediately async prefetch next batch while model is doing the forward pass on the GPU
+            X, Y = get_batch("train")
 
         writer.add_scalar("train/loss", loss[-1].item(), iter_num)
         writer.add_scalar("charts/learning_rate", train_state.opt_state[2][1].hyperparams["learning_rate"][-1].item(), iter_num)
