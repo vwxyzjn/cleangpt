@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass, field
 from typing import List, Optional, Tuple
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import optax
 import tyro
@@ -109,8 +110,8 @@ def init_model(key: jax.random.PRNGKey, args: Args) -> TrainState:
     y = jax.random.randint(
         key, (args.local_batch_size, args.block_size), minval=0, maxval=args.vocab_size, dtype=args.input_dtype
     )  # B; or local_batch_size, sequence_length
-    gpt_params = gpt.init(key, x, y, deterministic=True)
-    print(gpt.tabulate(key, x, y, deterministic=True))
+    gpt_params = gpt.init(key, x, deterministic=True)
+    print(gpt.tabulate(key, x, deterministic=True))
     optimizer = optax.chain(
         optax.clip_by_global_norm(args.grad_norm_clip),
         optax.inject_hyperparams(optax.adamw)(
@@ -227,9 +228,19 @@ if __name__ == "__main__":
     @partial(jax.pmap, axis_name='batch', devices=global_devices)
     def update(train_state: TrainState, x, y, dropout_keys):
         dropout_keys = jax.random.fold_in(dropout_keys, train_state.step)
-        (loss), grads = jax.value_and_grad(train_state.apply_fn, has_aux=False)(
-            train_state.params, x, y, deterministic=False, rngs={"dropout": dropout_keys}
-        )
+
+        def loss_fn(params):
+            logits = train_state.apply_fn(params, x, deterministic=False, rngs={"dropout": dropout_keys})
+            # Costa: the following should be equivalent to `ignore_index=-1`
+            # in F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), ignore_index=-1)
+            valid_y = jnp.where(y == -1, 0, y)  # remove the mask from the integer labels for cross entropy
+            loss = optax.softmax_cross_entropy_with_integer_labels(
+                logits.reshape(-1, jnp.shape(logits)[-1]), valid_y.reshape(-1)
+            )
+            loss = loss.mean(where=y.reshape(-1) != -1)  # only calculate the mean for indices that are ignored
+            return loss
+
+        (loss), grads = jax.value_and_grad(loss_fn, has_aux=False)(train_state.params)
         grads = jax.lax.pmean(grads, axis_name="batch")
         loss = jax.lax.pmean(loss, axis_name="batch")
         train_state = train_state.apply_gradients(grads=grads)

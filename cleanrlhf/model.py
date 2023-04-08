@@ -140,7 +140,7 @@ class GPT(nn.Module):
     block_size: int = None
 
     @nn.compact
-    def __call__(self, idx, targets: jnp.array, deterministic=None):
+    def __call__(self, idx, deterministic=None):
         _, T = jnp.shape(idx)  # B, T
         assert T <= self.block_size, f"Cannot forward sequence of length {T}, block size is only {self.block_size}"
         pos = jnp.arange(0, T)[None]  # shape (1, T)
@@ -166,16 +166,7 @@ class GPT(nn.Module):
 
         x = nn.LayerNorm(1e-5, dtype=self.config.dtype, use_bias=self.config.use_bias, name="ln_f")(x)
         logits = wte.attend(x)
-        if targets is None:
-            return logits
-        # Costa: the following should be equivalent to `ignore_index=-1`
-        # in F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-        valid_targets = jnp.where(targets == -1, 0, targets)  # remove the mask from the integer labels for cross entropy
-        loss = optax.softmax_cross_entropy_with_integer_labels(
-            logits.reshape(-1, jnp.shape(logits)[-1]), valid_targets.reshape(-1)
-        )
-        loss = loss.mean(where=targets.reshape(-1) != -1)  # only calculate the mean for indices that are ignored
-        return loss
+        return logits
 
 
 GPTConfigPreset = tyro.extras.subcommand_type_from_defaults(
@@ -226,7 +217,6 @@ def generate(train_state, block_size, key, input_tokens, max_new_tokens, tempera
         logits = train_state.apply_fn(
             train_state.params,
             jax.lax.dynamic_slice(tokens, (0, start_i), (B, block_size)),
-            targets=None,
             deterministic=False,
             rngs={"dropout": step_key},
         )  # TODO: (0, 0) is going to be problematic
@@ -303,7 +293,17 @@ if __name__ == "__main__":
         vocab_size=3,
         block_size=11,
     )
-    gpt_params = gpt.init(params_key, x, y, deterministic=True)
-    gpt_loss, (gpt_y) = gpt.apply(gpt_params, x, y, deterministic=True)
+    gpt_params = gpt.init(params_key, x, deterministic=True)
+    def loss_fn(gpt_params, x, targets=None, deterministic=False):
+        logits = gpt.apply(gpt_params, x, targets, deterministic=deterministic)
+        # Costa: the following should be equivalent to `ignore_index=-1`
+        # in F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        valid_targets = jnp.where(targets == -1, 0, targets)  # remove the mask from the integer labels for cross entropy
+        loss = optax.softmax_cross_entropy_with_integer_labels(
+            logits.reshape(-1, jnp.shape(logits)[-1]), valid_targets.reshape(-1)
+        )
+        loss = loss.mean(where=targets.reshape(-1) != -1)  # only calculate the mean for indices that are ignored
+        return loss
+    gpt_loss, (gpt_y) = loss_fn(gpt_params, x, y, deterministic=True)
     x = jnp.array([[0, 1, 1, 2, 2, 1], [0, 1, 1, 2, 0, 2], [0, 1, 2, 2, 1, 0]])
-    logits = gpt.apply(gpt_params, x, targets=None, deterministic=True)
+    logits = gpt.apply(gpt_params, x, deterministic=True)
