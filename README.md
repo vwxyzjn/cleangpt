@@ -1,6 +1,6 @@
 # CleanRLHF
 
-This is an experimental repository for me to learn more about Transformers, GPT, and RLHF. 
+This is an experimental repository for me to learn more about Transformers, GPT, and RLHF. There is no RLHF in this repository yet.
 
 ## Get Started
 
