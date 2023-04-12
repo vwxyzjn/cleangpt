@@ -61,7 +61,9 @@ class CausalSelfAttention(nn.Module):
         bias = jnp.tril(jnp.ones((self.block_size, self.block_size))).reshape(1, 1, self.block_size, self.block_size)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        c_attn = nn.Dense(3 * C, use_bias=self.use_bias, dtype=self.dtype)(x)  # (B, T, 3 * C), `c_attn` means `concatenated attention`
+        c_attn = nn.Dense(3 * C, use_bias=self.use_bias, dtype=self.dtype)(
+            x
+        )  # (B, T, 3 * C), `c_attn` means `concatenated attention`
         q, k, v = jnp.split(c_attn, 3, axis=-1)  # each has shape (B, T, C)
         q = q.reshape(B, T, self.n_head, head_dim).swapaxes(1, 2)  # (B, nh, T, hd), nh: n_head, hd: head dimensionality
         k = k.reshape(B, T, self.n_head, head_dim).swapaxes(1, 2)  # (B, nh, T, hd)
@@ -294,6 +296,7 @@ if __name__ == "__main__":
         block_size=11,
     )
     gpt_params = gpt.init(params_key, x, deterministic=True)
+
     def loss_fn(gpt_params, x, targets=None, deterministic=False):
         logits = gpt.apply(gpt_params, x, targets, deterministic=deterministic)
         # Costa: the following should be equivalent to `ignore_index=-1`
@@ -304,6 +307,7 @@ if __name__ == "__main__":
         )
         loss = loss.mean(where=targets.reshape(-1) != -1)  # only calculate the mean for indices that are ignored
         return loss
+
     gpt_loss, (gpt_y) = loss_fn(gpt_params, x, y, deterministic=True)
     x = jnp.array([[0, 1, 1, 2, 2, 1], [0, 1, 1, 2, 0, 2], [0, 1, 2, 2, 1, 0]])
     logits = gpt.apply(gpt_params, x, deterministic=True)

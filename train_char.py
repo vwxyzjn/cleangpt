@@ -1,10 +1,13 @@
-from functools import partial
+import contextlib
 import os
 import pickle
 import random
 import subprocess
 import time
+import timeit
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
+from functools import partial
 from typing import List, Optional, Tuple
 
 import jax
@@ -12,8 +15,8 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import tyro
-from flax.training.train_state import TrainState
 from flax.jax_utils import replicate, unreplicate
+from flax.training.train_state import TrainState
 from orbax.checkpoint import (
     Checkpointer,
     CheckpointManager,
@@ -54,8 +57,10 @@ class Args:
     """the entity (team) of wandb's project"""
 
     # logistics args
-    data_dir: str = "./data/shakespeare_char"
+    data_dir: str = "./data"
     """the data_dir to use"""
+    dataset: str = "shakespeare_char"
+    """the dataset to use"""
     ckpt_dir: Optional[str] = None
     """the checkpoint directory to use"""
 
@@ -84,6 +89,8 @@ class Args:
     """the model's hyperparameters"""
     input_dtype: Optional[str] = "uint16"
     """TO BE UPDATED IN RUNTIME: the input dtype to use"""
+    profile: bool = False
+    """if toggled, the forward and backward pass will be timmed"""
 
     # distributed args
     distributed: bool = False
@@ -132,12 +139,22 @@ def init_model(key: jax.random.PRNGKey, args: Args) -> TrainState:
     )
 
 
+@contextlib.contextmanager
+def time_activity(activity_name: str):
+    print(f"[Timing] {activity_name} start.")
+    start = timeit.default_timer()
+    yield
+    duration = timeit.default_timer() - start
+    print(f"[Timing] {activity_name} finished (Took {duration:.4f}s).")
+
+
 if __name__ == "__main__":
     args = tyro.cli(Args)
     run_name = f"{args.exp_name}__{args.seed}__{int(time.time())}"
 
     # load data's vocab_size
-    meta_path = os.path.join(args.data_dir, "meta.pkl")
+    dataset_dir = os.path.join(args.data_dir, args.dataset)
+    meta_path = os.path.join(dataset_dir, "meta.pkl")
     vocab_size = None
     if os.path.exists(meta_path):
         with open(meta_path, "rb") as f:
@@ -147,8 +164,8 @@ if __name__ == "__main__":
     if vocab_size is None:
         print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
         vocab_size = 50304
-    train_data = np.memmap(os.path.join(args.data_dir, "train.bin"), dtype=np.uint16, mode="r")
-    val_data = np.memmap(os.path.join(args.data_dir, "val.bin"), dtype=np.uint16, mode="r")
+    train_data = np.memmap(os.path.join(dataset_dir, "train.bin"), dtype=np.uint16, mode="r")
+    val_data = np.memmap(os.path.join(dataset_dir, "val.bin"), dtype=np.uint16, mode="r")
 
     # jax distributed
     if args.distributed:
@@ -160,7 +177,7 @@ if __name__ == "__main__":
     args.vocab_size = vocab_size
     args.batch_size = args.local_batch_size * jax.local_device_count() * args.gradient_accumulation_steps * args.world_size
     if args.ckpt_dir is None:
-        args.ckpt_dir = f"runs/{run_name}/models"
+        args.ckpt_dir = f"models/{run_name}"
     args.world_size = jax.process_count()
     args.local_rank = jax.process_index()
     args.global_devices = [str(item) for item in global_devices]
@@ -225,7 +242,7 @@ if __name__ == "__main__":
     iter_dt = 0.0
     X, Y = get_batch("train")  # fetch the very first batch
 
-    @partial(jax.pmap, axis_name='batch', devices=global_devices)
+    @partial(jax.pmap, axis_name="batch", devices=global_devices)
     def update(train_state: TrainState, x, y, dropout_keys):
         dropout_keys = jax.random.fold_in(dropout_keys, train_state.step)
 
@@ -246,14 +263,18 @@ if __name__ == "__main__":
         train_state = train_state.apply_gradients(grads=grads)
         return train_state, (loss)
 
+    time_ctx = time_activity("train") if args.profile else nullcontext()
     while True:
-        for micro_step in range(args.gradient_accumulation_steps):
-            train_state, (loss) = update(train_state, X, Y, dropout_keys)
-            # immediately async prefetch next batch while model is doing the forward pass on the GPU
-            X, Y = get_batch("train")
+        with time_ctx:
+            for micro_step in range(args.gradient_accumulation_steps):
+                train_state, (loss) = update(train_state, X, Y, dropout_keys)
+                # immediately async prefetch next batch while model is doing the forward pass on the GPU
+                X, Y = get_batch("train")
 
         writer.add_scalar("train/loss", loss[-1].item(), iter_num)
-        writer.add_scalar("charts/learning_rate", train_state.opt_state[2][1].hyperparams["learning_rate"][-1].item(), iter_num)
+        writer.add_scalar(
+            "charts/learning_rate", train_state.opt_state[2][1].hyperparams["learning_rate"][-1].item(), iter_num
+        )
         if iter_num % 10 == 0:
             print(f"iter_dt {iter_dt * 1000:.2f}ms; iter {iter_num}: train loss {loss[-1].item():.5f}")
 
